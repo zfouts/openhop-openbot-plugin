@@ -166,7 +166,8 @@ def test_corescope_rebuilt_when_its_config_changes(tmp_path):
 
 def test_corescope_ships_disabled():
     from openhop_openbot.config import defaults
-    assert defaults()["corescope"] == {"enabled": False, "base_url": "", "shortener": "v.gd"}
+    assert defaults()["corescope"] == {"enabled": False, "base_url": "", "shortener": "v.gd",
+                                      "shortener_url": "", "shortener_key": ""}
 
 
 def test_unknown_config_sections_are_ignored(tmp_path):
@@ -211,6 +212,22 @@ def test_shortener_follows_corescope_config(tmp_path, name, want):
     got = h.engine.shortener
     assert (got.service if got else None) == want
     assert any("shortener" in p for p in h.problems) == (name == "bit.ly")
+
+
+def test_custom_shortener_from_config(tmp_path):
+    h = _hub_with(tmp_path, {"corescope": {"enabled": True, "base_url": "https://cs.example",
+                                           "shortener": "custom",
+                                           "shortener_url": "https://short.example.org",
+                                           "shortener_key": "k"}})
+    assert h.engine.shortener.label == "short.example.org" and not h.problems
+
+
+@pytest.mark.parametrize("url", ["", "http://short.example.org"])
+def test_custom_shortener_needs_an_https_url(tmp_path, url):
+    h = _hub_with(tmp_path, {"corescope": {"enabled": True, "base_url": "https://cs.example",
+                                           "shortener": "custom", "shortener_url": url}})
+    assert h.engine.shortener is None
+    assert any(p.startswith("corescope.shortener_url") for p in h.problems)
 
 
 async def test_ping_took_is_measured_to_when_the_frame_was_heard(hub):

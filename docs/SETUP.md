@@ -305,6 +305,7 @@ The link is shortened before it goes on the air:
 | `is.gd` | [is.gd](https://is.gd/apishorteningreference.php), v.gd's sister service, same limits. |
 | `tinyurl.com` | TinyURL's keyless `api-create.php` endpoint. |
 | `da.gd` | [da.gd](https://da.gd/help). |
+| `custom` | Your own shortener running the same software as v.gd and is.gd. Set its address and, if it needs one, its key. |
 | `none` | No shortener: the full link, used only when it fits beside the hashes (short paths). |
 
 Each link is shortened once per run. If the shortener fails or is
@@ -312,11 +313,26 @@ rate-limited, `!path` uses the full link if it fits beside every hash, and
 otherwise sends the hashes alone. Services that need an account token
 (Bitly, TinyURL's v2 API) are not offered.
 
+### Custom shortener
+
+Pick **Custom (v.gd API)** to use a shortener you run yourself. It must speak
+v.gd's API: the bot calls
+
+```
+<shortener_url>/create.php?format=simple&key=<shortener_key>&url=<map link>
+```
+
+and expects the short link back as plain text. `key` is left out when no key
+is set. Only links on the shortener's own host (under its path, if it has
+one) are accepted. The key is never written to the log.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `corescope.enabled` | `false` | The tick. |
 | `corescope.base_url` | empty | The address you open CoreScope at, without `/api`, for example `https://analyzer.example.net` or `http://10.0.0.5:3000`. http and https both work. |
 | `corescope.shortener` | `v.gd` | One of the services above. |
+| `corescope.shortener_url` | empty | For `custom`: the shortener's https address, for example `https://short.example.org`. |
+| `corescope.shortener_key` | empty | For `custom`: sent as the `key` parameter. Leave empty if your shortener needs none. |
 
 What is sent: the shortener gets the full map link (packet hash and hop
 hashes) and nothing else. `!path` makes no request to CoreScope itself.

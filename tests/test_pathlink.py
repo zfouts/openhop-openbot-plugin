@@ -7,10 +7,12 @@ import pytest
 from openhop_openbot.engine.builtins import fn_path
 from openhop_openbot.services.corescope import CoreScope
 from openhop_openbot.services.shortener import (
+    CHOICES,
     SERVICES,
     Shortener,
     ShortenError,
     _default_get,
+    custom_base,
     make_shortener,
 )
 from openhop_openbot.store import Store
@@ -105,6 +107,82 @@ def test_service_names_and_none():
         Shortener("bit.ly")
     with pytest.raises(ValueError):
         make_shortener("bit.ly")
+
+
+# ------------------------------------------------------ custom shortener --
+
+def test_custom_shortener_sends_the_key_and_accepts_its_own_links():
+    get = FakeGet(body="https://short.example.org/aB3_x\n")
+    s = make_shortener("custom", base_url="https://short.example.org/", key="s3cr&t", get=get)
+    assert s.shorten(LONG) == "https://short.example.org/aB3_x"
+    url = get.calls[0][0]
+    assert url.startswith("https://short.example.org/create.php?")
+    q = parse_qs(urlsplit(url).query)
+    assert q == {"format": ["simple"], "key": ["s3cr&t"], "url": [LONG]}
+    assert s.label == "short.example.org"
+
+
+def test_custom_shortener_without_a_key_sends_none():
+    get = FakeGet(body="https://short.example.org/abc")
+    Shortener("custom", base_url="https://short.example.org", get=get).shorten(LONG)
+    assert "key" not in parse_qs(urlsplit(get.calls[0][0]).query)
+
+
+def test_custom_shortener_under_a_path_and_with_a_port():
+    get = FakeGet(body="https://Ex.org:8443/s/abc")
+    s = Shortener("custom", base_url="https://EX.org:8443/s", get=get)
+    assert get.calls == [] and s.label == "ex.org:8443"
+    with pytest.raises(ShortenError):        # host case differs from the normalised base
+        s.shorten(LONG)
+    get.body = "https://ex.org:8443/s/abc"
+    assert s.shorten(LONG) == "https://ex.org:8443/s/abc"
+    assert get.calls[-1][0].startswith("https://ex.org:8443/s/create.php?format=simple&url=")
+
+
+@pytest.mark.parametrize("body", [
+    "https://v.gd/abc",                       # another service
+    "https://short.example.org.evil.net/abc",  # look-alike host
+    "http://short.example.org/abc",           # not https
+    "https://short.example.org/a/b",          # deeper path
+    "Error: Not authorized.",
+])
+def test_custom_shortener_rejects_anything_but_its_own_links(body):
+    s = Shortener("custom", base_url="https://short.example.org", get=FakeGet(body=body))
+    with pytest.raises(ShortenError):
+        s.shorten(LONG)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "short.example.org", "http://short.example.org",
+                                 "ftp://short.example.org", "https://", "https://x.org/?a=1",
+                                 "https://x.org/#f", "https://u:p@x.org", "https://x .org"])
+def test_custom_base_must_be_a_plain_https_url(bad):
+    with pytest.raises(ValueError):
+        custom_base(bad)
+    with pytest.raises(ValueError):
+        make_shortener("custom", base_url=bad)
+
+
+def test_custom_key_never_appears_in_errors():
+    key = "k3y/with+chars"
+    s = Shortener("custom", base_url="https://short.example.org", key=key,
+                  get=FakeGet(status=403, body="Error: bad key " + key))
+    with pytest.raises(ShortenError) as e:
+        s.shorten(LONG)
+    assert key not in str(e.value) and "***" in str(e.value)
+    assert str(e.value).startswith("short.example.org: HTTP 403")
+
+    def leaky(url, headers, timeout):
+        raise OSError("failed fetching " + url)
+
+    s = Shortener("custom", base_url="https://short.example.org", key=key, get=leaky)
+    with pytest.raises(ShortenError) as e:
+        s.shorten(LONG)
+    assert key not in str(e.value) and "k3y%2Fwith%2Bchars" not in str(e.value)
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+
+
+def test_custom_is_a_choice_but_not_a_fixed_service():
+    assert "custom" in CHOICES and "custom" not in SERVICES
 
 
 class _Handler(BaseHTTPRequestHandler):

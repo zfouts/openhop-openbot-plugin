@@ -100,13 +100,17 @@ empty is not sent and does not use the cooldown.
 ### CoreScope
 
 ```json
-"corescope": {"enabled": false, "base_url": "", "shortener": "v.gd"}
+"corescope": {"enabled": false, "base_url": "", "shortener": "v.gd",
+              "shortener_url": "", "shortener_key": ""}
 ```
 
 With `corescope.enabled`, `{path}` appends
 `<base_url>/#/map?packet=<PACKET HASH>&hops=<h1>,<h2>,...`, shortened by
-`corescope.shortener` (`v.gd`, `is.gd`, `tinyurl.com`, `da.gd`, or `none` for
-the full link). The link needs the request frame's packet hash; without one,
+`corescope.shortener` (`v.gd`, `is.gd`, `tinyurl.com`, `da.gd`, `custom`, or
+`none` for the full link). `custom` calls
+`<shortener_url>/create.php?format=simple[&key=<shortener_key>]&url=<link>`
+(v.gd's API) and accepts only https links on that host; `shortener_url` must
+be https, and a missing or invalid one is reported in `config_problems`. The link needs the request frame's packet hash; without one,
 or without CoreScope, `{path}` is the hop count and hashes only. A shortener
 failure falls back to the full link if it fits beside every hash, else no
 link. An unknown `shortener` is reported in `config_problems` and treated as

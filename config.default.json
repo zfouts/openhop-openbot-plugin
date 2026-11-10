@@ -125,6 +125,8 @@
   "corescope": {
     "enabled": false,
     "base_url": "",
-    "shortener": "v.gd"
+    "shortener": "v.gd",
+    "shortener_url": "",
+    "shortener_key": ""
   }
 }

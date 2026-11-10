@@ -150,10 +150,16 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         problems.append("node.name is %d bytes; the radio keeps at most 31, so it is not "
                         "applied to the radio" % len(name.encode("utf-8")))
 
-    from .services.shortener import CHOICES
-    sh = (cfg.get("corescope") or {}).get("shortener")
+    from .services.shortener import CHOICES, CUSTOM, custom_base
+    cs = cfg.get("corescope") or {}
+    sh = cs.get("shortener")
     if sh not in (None, "") and str(sh).strip().lower() not in CHOICES:
         problems.append(f"corescope.shortener must be one of {', '.join(CHOICES)} (got {sh!r})")
+    elif str(sh or "").strip().lower() == CUSTOM:
+        try:
+            custom_base(cs.get("shortener_url"))
+        except ValueError as exc:
+            problems.append(f"corescope.shortener_url: {exc}")
     return cfg, problems
 
 

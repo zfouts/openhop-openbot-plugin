@@ -22,7 +22,7 @@ const DEFAULTS = {
   limits: { tx_gap_s: 2.5, tx_max_per_min: 8, user_cooldown_s: 5, reply_in_request_region: true },
   commands: [], announcements: [],
   weather: { units: 'auto', default_country: 'us', contact: '' },
-  corescope: { enabled: false, base_url: '', shortener: 'v.gd' },
+  corescope: { enabled: false, base_url: '', shortener: 'v.gd', shortener_url: '', shortener_key: '' },
 };
 
 const TABS = [
@@ -248,6 +248,7 @@ function validate() {
   num(c.node.path_hash_bytes, 'path_hash_bytes', 1, 3);
   num(c.limits.tx_gap_s, 'tx_gap_s', 0); num(c.limits.tx_max_per_min, 'tx_max_per_min', 0); num(c.limits.user_cooldown_s, 'user_cooldown_s', 0);
   if ((c.corescope.enabled || c.corescope.base_url) && !/^https?:\/\/[^\/\s]+/.test(c.corescope.base_url || '')) e.push('CoreScope base URL must start with http:// or https://');
+  if (c.corescope.shortener === 'custom' && !/^https:\/\/[^\/\s?#]+[^\s?#]*$/.test(c.corescope.shortener_url || '')) e.push('Custom shortener URL must be an https:// address');
   if (c.weather.default_country && !/^[A-Za-z]{2}$/.test(c.weather.default_country)) e.push('Default country must be a 2-letter code such as us, gb or de');
   if (c.node.latitude != null) num(c.node.latitude, 'Latitude', -90, 90);
   if (c.node.longitude != null) num(c.node.longitude, 'Longitude', -180, 180);
@@ -623,7 +624,7 @@ function tabStatus() {
           kv([['Name', s.node_name], ['Pubkey', s.pubkey], ['Position', s.latitude != null && s.longitude != null ? s.latitude + ', ' + s.longitude : null]])),
         h('div', { class: 'card' }, h('h3', { text: 'CoreScope links' }),
           h('p', {}, pill(cfg.corescope.enabled ? 'on' : 'off', cfg.corescope.enabled ? true : undefined)),
-          h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + (cfg.corescope.shortener || 'v.gd') : '!path replies with hop hashes only.' }))),
+          h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + shortenerLabel(cfg.corescope) : '!path replies with hop hashes only.' }))),
       updBox,
       h('div', { class: 'card' }, h('h3', { text: 'Counters' }),
         h('div', { class: 'counters' }, Object.entries(c).map(([k, v]) => h('div', { class: 'counter' }, h('b', { text: String(v) }), h('span', { text: k }))))),
@@ -1097,9 +1098,18 @@ function tabNodes() {
 }
 
 // ---------------------------------------------------------------- tab: corescope
-const SHORTENERS = [['v.gd', 'v.gd'], ['is.gd', 'is.gd'], ['tinyurl.com', 'TinyURL'], ['da.gd', 'da.gd'], ['none', 'None (full link)']];
+const SHORTENERS = [['v.gd', 'v.gd'], ['is.gd', 'is.gd'], ['tinyurl.com', 'TinyURL'], ['da.gd', 'da.gd'], ['custom', 'Custom (v.gd API)'], ['none', 'None (full link)']];
+function shortenerLabel(cs) {
+  if (cs.shortener !== 'custom') return cs.shortener || 'v.gd';
+  try { return new URL(cs.shortener_url).host; } catch (_) { return 'custom shortener'; }
+}
 function tabCoreScope() {
   const cs = cfg.corescope;
+  const custom = h('div', { class: 'grid' },
+    field('Shortener URL', textIn(cs, 'shortener_url', { mono: true, ph: 'https://short.example.org' }), 'Your own service with v.gd\'s API. The bot calls <URL>/create.php?format=simple&key=…&url=… and accepts only links back on this host.'),
+    field('Shortener key', textIn(cs, 'shortener_key', { mono: true, type: 'password', ph: 'optional' }), 'Sent as the key parameter. Leave empty if your service needs none.'));
+  const showCustom = () => { custom.hidden = cs.shortener !== 'custom'; };
+  showCustom();
   return { el: h('div', {},
     h('div', { class: 'card stack' }, h('h2', { text: 'CoreScope map links' }),
       h('p', { text: '!path answers with the hop count and the hop hashes in travel order. With CoreScope on, it adds a short link to that route on CoreScope\'s map: "@[bob] [3h] 03b9,4216,d924 https://v.gd/AbC123". The map opens the packet by its hash, so it draws the route when CoreScope\'s observers heard the same packet.' }),
@@ -1107,7 +1117,8 @@ function tabCoreScope() {
       check('Add CoreScope map links to !path', cs, 'enabled'),
       h('div', { class: 'grid' },
         field('CoreScope base URL', textIn(cs, 'base_url', { mono: true, ph: 'https://analyzer.example.net' }), 'The address you open CoreScope at, without /api.'),
-        field('Link shortener', sel(cs, 'shortener', SHORTENERS), 'Keyless services. "None" sends the full link, which only fits short paths.')))) };
+        field('Link shortener', sel(cs, 'shortener', SHORTENERS, { onchange: showCustom }), '"Custom" is your own v.gd-compatible service. "None" sends the full link, which only fits short paths.')),
+      custom)) };
 }
 
 // ---------------------------------------------------------------- tab: advanced

@@ -190,15 +190,17 @@ class Hub:
             except ValueError as exc:
                 logger.error("corescope disabled: %s", exc)
         try:
-            self.engine.shortener = make_shortener(cs.get("shortener", DEFAULT_SHORTENER),
-                                                   user_agent=ua)
+            self.engine.shortener = make_shortener(
+                cs.get("shortener", DEFAULT_SHORTENER), user_agent=ua,
+                base_url=str(cs.get("shortener_url") or ""),
+                key=str(cs.get("shortener_key") or ""))
         except ValueError as exc:
             self.engine.shortener = None
             logger.error("no link shortener: %s", exc)
         if self.engine.corescope is not None:
             logger.info("!path links to CoreScope's map at %s (shortener: %s)",
                         self.engine.corescope.base,
-                        self.engine.shortener.service if self.engine.shortener else "none")
+                        self.engine.shortener.label if self.engine.shortener else "none")
 
     @staticmethod
     def _strip_cmd(v: Any) -> str:
