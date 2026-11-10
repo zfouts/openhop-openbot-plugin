@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhop-openbot-plugin"
+version = "1.0.0"
+description = "Standalone MeshCore command bot for openHop Repeater: !path, !seen, !wx, region- and channel-scoped commands, with optional CoreScope map links"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "zfouts" }]
+keywords = ["meshcore", "openhop", "lora", "mesh", "bot"]
+
+dependencies = [
+  "openhop-core>=1.1.1,<2",
+  "pynacl>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-asyncio>=0.23.0",
+  "ruff>=0.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zfouts/openhop-openbot-plugin"
+
+[project.scripts]
+openhop-openbot = "openhop_openbot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openhop_openbot*"]
+
+# The plugin manager discovers manifests under share/openhop/plugins/<id>/ and
+# serves the UI subtree named by the manifest's ui.entry from there.
+[tool.setuptools.data-files]
+"share/openhop/plugins/openhop.openbot" = ["openhop-plugin.json", "config.default.json"]
+"share/openhop/plugins/openhop.openbot/ui" = ["ui/index.html", "ui/app.js", "ui/styles.css"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]

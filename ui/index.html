@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>OpenBot</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#view">Skip to content</a>
+<header class="top">
+  <div class="brand">
+    <h1>OpenBot</h1>
+    <span id="conn" class="pill" role="status">Loading</span>
+    <span id="ver" class="muted small"></span>
+  </div>
+  <div class="actions">
+    <span id="dirty" class="dirty" hidden>Unsaved changes</span>
+    <button id="btn-revert" type="button" disabled>Revert</button>
+    <button id="btn-save" type="button" class="primary" disabled>Save</button>
+  </div>
+</header>
+<nav class="tabs" id="tabs" role="tablist" aria-label="Sections"></nav>
+<div id="update" class="banner update" role="status" hidden></div>
+<div id="banner" class="banner" role="status" hidden></div>
+<div id="problems" class="problems" role="alert" hidden></div>
+<div id="auth" hidden></div>
+<main id="view" tabindex="-1"><p class="muted pad">Loading configuration...</p></main>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<noscript><p class="pad">This console needs JavaScript.</p></noscript>
+<script src="app.js"></script>
+</body>
+</html>

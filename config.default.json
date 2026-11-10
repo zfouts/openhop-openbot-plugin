@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "log_level": "INFO",
+  "companion": {
+    "host": "127.0.0.1",
+    "port": 5001
+  },
+  "node": {
+    "name": "",
+    "latitude": null,
+    "longitude": null,
+    "timezone": "America/Chicago",
+    "units": "imperial",
+    "path_hash_bytes": 2
+  },
+  "channels": [
+    {
+      "idx": 1,
+      "name": "#bot"
+    }
+  ],
+  "regions": [],
+  "scope": {
+    "channels": [
+      "#bot"
+    ],
+    "regions": [],
+    "allow_dm": true,
+    "protected_channels": [
+      "Public"
+    ],
+    "max_hops": null
+  },
+  "limits": {
+    "tx_gap_s": 2.5,
+    "tx_max_per_min": 8,
+    "user_cooldown_s": 5,
+    "reply_in_request_region": true
+  },
+  "commands": [
+    {
+      "id": "path",
+      "enabled": true,
+      "trigger": "!path",
+      "description": "Trace the RF path your message took to this bot",
+      "reply": "{path}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 10
+    },
+    {
+      "id": "ping",
+      "enabled": true,
+      "trigger": "!ping",
+      "description": "Signal report",
+      "reply": "@[{sender}] pong! {hops} hops traversed, took {took} seconds.",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 10
+    },
+    {
+      "id": "seen",
+      "enabled": true,
+      "trigger": "!seen",
+      "description": "When a node was last heard",
+      "reply": "{seen}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 10
+    },
+    {
+      "id": "whois",
+      "enabled": true,
+      "trigger": "!whois",
+      "description": "Resolve a hop hash prefix to node names",
+      "reply": "{whois}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 10
+    },
+    {
+      "id": "stats",
+      "enabled": true,
+      "trigger": "!stats",
+      "description": "Roster and traffic counts",
+      "reply": "{stats}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
+    },
+    {
+      "id": "wx",
+      "enabled": false,
+      "trigger": "!wx",
+      "description": "Weather anywhere: !wx 76131, !wx Karlsruhe, !wx 32.9,-97.3",
+      "reply": "{forecast}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 60
+    },
+    {
+      "id": "help",
+      "enabled": true,
+      "trigger": "!help",
+      "description": "List commands",
+      "reply": "{help}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
+    }
+  ],
+  "announcements": [],
+  "weather": {
+    "units": "auto",
+    "default_country": "us",
+    "contact": ""
+  },
+  "corescope": {
+    "enabled": false,
+    "base_url": "",
+    "shortener": "v.gd"
+  }
+}
