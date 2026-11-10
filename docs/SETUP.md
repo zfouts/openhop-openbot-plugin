@@ -370,8 +370,8 @@ again**, and every six hours while it stays open.
 **One-time step for a wheel install.** openHop only records which repository
 a plugin comes from when it installs it from its catalogue. After installing
 by uploading the wheel, the card says **Unavailable**. Record the repository
-once, as root or the repeater user, on the repeater (inside its container if
-it runs in one):
+once, and mark the plugin as a local install, as root or the repeater user, on
+the repeater (inside its container if it runs in one):
 
 ```bash
 python3 - <<'EOF'
@@ -379,9 +379,15 @@ import json, pathlib
 p = pathlib.Path("/var/lib/openhop_repeater/plugins/openhop.openbot/state.json")
 s = json.loads(p.read_text())
 s["repository"] = "zfouts/openhop-openbot-plugin"
+s["source"] = "local"
 p.write_text(json.dumps(s, indent=2) + "\n")
 EOF
 ```
+
+Set `source` too. Without it, openHop labels the plugin a catalogue install
+after its first one-click update. It then looks for OpenBot in its own
+catalogue, which doesn't list it, and every later check fails with `plugin not
+in catalogue`. openHop keeps a `source` that is already set.
 
 openHop keeps the field through later installs and updates, uploaded or not.
 
@@ -391,6 +397,7 @@ openHop keeps the field through later installs and updates, uploaded or not.
 |---|---|
 | Updates card says **Unavailable** | The plugin was installed from an uploaded wheel. Do the one-time step in [Updating](#updating). |
 | Updates card says GitHub did not find the repository | openHop asks GitHub without signing in, so it cannot see a private repository. Update checks need the repository to be public. |
+| Check fails with `plugin not in catalogue: openhop.openbot` | openHop marked the plugin as a catalogue install during a one-click update. Set `"source": "local"` in its `state.json` (the one-time step in [Updating](#updating)), then click **Check again**. |
 | Updates card says **Check failed** | The repeater could not reach GitHub, or hit GitHub's limit of 60 unauthenticated API calls an hour (shared with openHop's own plugin checks). Wait and click **Check again**. |
 | Update failed | The notice shows openHop's error. A failed download changes nothing. A failed install happens after openHop has stopped the bot, so check the plugin's state on the Plugins page and start it if needed; its log has the details. |
 | State `FAILED` or log shows `Companion connection lost ... retry` | Companion not listening. Check step 3, the port, and that nothing else (another plugin, a phone app) holds the companion. |

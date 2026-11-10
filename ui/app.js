@@ -548,16 +548,20 @@ function updCard(box) {
     if (updRunning()) state = pill('Updating', 'warn');
     else if (upd.state === 'error') {
       state = pill('Check failed', 'bad');
-      hint = upd.status === 404
-        ? 'GitHub did not find the repository or its releases. openHop asks GitHub without signing in, so a private '
-          + 'repository looks the same as a missing one: update checks and one-click updates need a public repository.'
-        : 'Could not check for updates: ' + upd.error + '.';
+      hint = /not in catalogue/i.test(upd.error || '')
+        ? 'openHop treats this plugin as a catalogue install, but OpenBot is not in its catalogue. This happens after '
+          + 'a one-click update when state.json has no "source". Set "source": "local" in the plugin\'s state.json '
+          + '(see "Updating" in docs/SETUP.md), then check again.'
+        : upd.status === 404
+          ? 'GitHub did not find the repository or its releases. openHop asks GitHub without signing in, so a private '
+            + 'repository looks the same as a missing one: update checks and one-click updates need a public repository.'
+          : 'Could not check for updates: ' + upd.error + '.';
     }
     else if (upd.state === 'ok' && !i.repository) {
       state = pill('Unavailable');
       hint = 'openHop does not know which GitHub repository this plugin comes from, because it was installed from an uploaded wheel '
-        + 'rather than the openHop catalogue. Add "repository": "' + REPO + '" to the plugin\'s state.json once '
-        + '(see "Updating" in docs/SETUP.md); later installs keep it.';
+        + 'rather than the openHop catalogue. Add "repository": "' + REPO + '" and "source": "local" to the plugin\'s '
+        + 'state.json once (see "Updating" in docs/SETUP.md); later installs keep both.';
     } else if (updAvailable()) {
       state = pill('Update available', 'warn');
       if (i.releaseNotes) notes = h('div', {}, h('p', { class: 'small muted', style: 'margin:8px 0 4px', text: 'What\'s new in ' + latest }), h('pre', { class: 'notes', text: i.releaseNotes }));
