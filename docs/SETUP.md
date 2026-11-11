@@ -196,6 +196,36 @@ When a request used 1-byte path hashes, the bot also sends a second message
 asking the user to enable 2-byte hashes (at most once per 15 minutes per
 sender). Short hashes make hops ambiguous.
 
+## `!mpath`
+
+`!path` shows the one route that reached this node. `!mpath` shows every route
+the message took to CoreScope's observers. It needs CoreScope (see [CoreScope
+map links](#corescope-map-links-optional)). Without it, `!mpath` stays silent
+and `!help` leaves it out.
+
+```
+@[bob] asking CoreScope's observers, back in 30s
+@[bob] 9 routes to 6 observers, 1-5 hops, 2 direct https://v.gd/AbC123
+```
+
+A flood keeps reaching observers for tens of seconds after the first copy
+lands, so the bot answers in two parts. It acknowledges straight away, waits
+`corescope.mpath_wait_s` seconds (default 30), then asks CoreScope for every
+copy of the request's packet and replies on the same channel or DM.
+
+- A **route** is one observer and one distinct hop chain. An observer that
+  heard the message over three chains counts three routes.
+- **Direct** routes reached an observer with no relays.
+- The link opens CoreScope's page for the packet (`<base_url>/#/packet/<HASH>`),
+  which lists each observer and the path its copy took. It is shortened like
+  `!path`'s links.
+
+The request costs two messages of airtime, so `!mpath` has a 30 s cooldown.
+
+New installs have the `!mpath` command. If your saved commands came from an
+older version, open the CoreScope tab and click **Add the !mpath command**,
+then save.
+
 ## Usage
 
 The bot records every request that matches a command trigger in its SQLite
@@ -284,9 +314,10 @@ use.
 ## CoreScope map links (optional)
 
 If you run or use a [CoreScope](https://github.com/Kpa-clawbot/CoreScope)
-instance (a MeshCore analyzer), tick **Add CoreScope map links to !path** on
-the CoreScope tab (`corescope.enabled`), enter its address and pick a link
-shortener. `!path` then links to the route on CoreScope's map:
+instance (a MeshCore analyzer), tick **Use CoreScope (map links in !path,
+and !mpath)** on the CoreScope tab (`corescope.enabled`), enter its address
+and pick a link shortener. This also turns on [`!mpath`](#mpath). `!path`
+then links to the route on CoreScope's map:
 
 ```
 <base_url>/#/map?packet=956DB1890EBA6B1D&hops=03b9,4216,d924
@@ -333,9 +364,12 @@ one) are accepted. The key is never written to the log.
 | `corescope.shortener` | `v.gd` | One of the services above. |
 | `corescope.shortener_url` | empty | For `custom`: the shortener's https address, for example `https://short.example.org`. |
 | `corescope.shortener_key` | empty | For `custom`: sent as the `key` parameter. Leave empty if your shortener needs none. |
+| `corescope.mpath_wait_s` | `30` | Seconds `!mpath` waits for the flood to settle before asking CoreScope, 5 to 300. |
 
 What is sent: the shortener gets the full map link (packet hash and hop
 hashes) and nothing else. `!path` makes no request to CoreScope itself.
+`!mpath` sends CoreScope only the packet hash (`GET /api/packets/<hash>`), and
+the shortener gets the packet page link.
 
 `{pathnames}` (names and distance, see [`!path`](#path)) also uses CoreScope
 when it is on: it asks which nodes match each hop hash
@@ -406,6 +440,9 @@ openHop keeps the field through later installs and updates, uploaded or not.
 | Silent on Public | By design. |
 | `!path` has no link | CoreScope is off, the frame could not be matched to the message (no packet hash), or the shortener failed and the full link did not fit. Check the log for `link shortening failed`. |
 | The map link shows no route | CoreScope's observers did not hear that packet. The link only draws packets CoreScope has. |
+| `!mpath` never answers | CoreScope is off, or no enabled command uses `{mpath}` (CoreScope tab: **Add the !mpath command**). |
+| `!mpath` says `no CoreScope observer reported hearing that` | None of CoreScope's observers heard the packet, or it had not reached CoreScope by the time the bot asked. Raise `corescope.mpath_wait_s`. |
+| `!mpath` says `can't trace that copy: no packet hash` | The raw frame could not be matched to the message. Retry. |
 | `{pathnames}` shows only hashes or no distance | The roster is young: wait for adverts or turn on CoreScope. Distances need `node.latitude`/`longitude` and relays that advertise positions. |
 | `hop hashes unavailable for that copy` | The raw frame could not be matched to the message. Retry. |
 | `!wx` replies with usage | It needs a place: `!wx 76131`, `!wx Karlsruhe`, `!wx 32.9,-97.3`. |

@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ..mesh.frames import REGION_DIRECT, REGION_UNKNOWN, REGION_UNSCOPED, canonical_region
 from .builtins import BUILTINS
 from .templates import render
 
 DM = "dm"
+
+# A reply that comes later: (seconds to wait, blocking fn returning the text).
+FollowUp = Tuple[float, Callable[[], str]]
 
 
 def chan_norm(name: Any) -> str:
@@ -50,6 +53,7 @@ class Result:
     matched: Optional[str] = None   # command id
     reply: str = ""
     extra: List[str] = field(default_factory=list)
+    later: List[FollowUp] = field(default_factory=list)
     reason: str = ""
 
 
@@ -142,6 +146,7 @@ class Engine:
             "tz": node.get("timezone") or "UTC",
             "units": node.get("units") or "imperial",
             "extra": [],
+            "later": [],
         }
         if req is not None:
             ctx.update(
@@ -194,7 +199,8 @@ class Engine:
             for h in held:
                 self.store.release(*h)
             return Result(matched=cid, reason="reply rendered empty")
-        return Result(matched=cid, reply=reply, extra=list(ctx["extra"]))
+        return Result(matched=cid, reply=reply, extra=list(ctx["extra"]),
+                      later=list(ctx["later"]))
 
     def reply_scope(self, region: str) -> Optional[bytes]:
         """Flood scope for a reply to a request that arrived under ``region``.

@@ -160,6 +160,12 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
             custom_base(cs.get("shortener_url"))
         except ValueError as exc:
             problems.append(f"corescope.shortener_url: {exc}")
+
+    from .engine.mpath import DEFAULT_WAIT_S, MAX_WAIT_S, MIN_WAIT_S, parse_wait
+    w = cs.get("mpath_wait_s")
+    if w not in (None, "") and parse_wait(w) is None:
+        problems.append(f"corescope.mpath_wait_s must be {MIN_WAIT_S}-{MAX_WAIT_S} seconds "
+                        f"(got {w!r}); using {DEFAULT_WAIT_S}")
     return cfg, problems
 
 

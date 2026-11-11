@@ -101,7 +101,7 @@ empty is not sent and does not use the cooldown.
 
 ```json
 "corescope": {"enabled": false, "base_url": "", "shortener": "v.gd",
-              "shortener_url": "", "shortener_key": ""}
+              "shortener_url": "", "shortener_key": "", "mpath_wait_s": 30}
 ```
 
 With `corescope.enabled`, `{path}` appends
@@ -122,6 +122,22 @@ roster for that lookup. `corescope.base_url` must be `http://` or `https://`;
 an invalid one logs `corescope disabled: ...` (no links, local roster only).
 Any CoreScope failure (5 s timeout, non-200, malformed body, over 1 MB)
 falls back to the local roster alone.
+
+`{mpath}` renders empty without CoreScope (and `{help}` then leaves out any
+command whose reply uses it). With CoreScope it renders an acknowledgement
+and, `mpath_wait_s` seconds later (5-300, default 30; anything else is
+reported in `config_problems` and 30 is used), the bot fetches
+`GET <base_url>/api/packets/<packet hash>` and sends a second message to the
+same channel or DM, in the same region:
+`@[<sender>] <N> routes to <M> observers, <lo>-<hi> hops[, <D> direct] <link>`.
+A route is one observer and one distinct hop chain; observations with
+`direction: "tx"` or an unreadable `path_json` are skipped. The link is
+`<base_url>/#/packet/<PACKET HASH>`, shortened like `{path}`'s, dropped
+whole if it does not fit. A 404 answers `no CoreScope observer reported
+hearing that`; any other failure answers `CoreScope lookup failed, try again
+later`. No packet hash (unmatched frame, or a dry run) answers `can't trace
+that copy: no packet hash` with no follow-up. At most 16 follow-ups wait at
+once; more are dropped with an `error` activity entry.
 
 ## The `_cmd` mailbox
 

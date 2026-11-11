@@ -2,6 +2,7 @@
 
     companion ──► on_raw_frame ──► correlator (hop chain, region) + roster
               └─► on_message ───► Request ──► Engine (worker thread) ──► TxQueue ──► companion
+                                                 └─► follow-ups (`!mpath`) ──(wait)──┘
     config.json ──(mtime poll)──► reload + `_cmd` mailbox
     runtime.json ◄── snapshot every few seconds and on change
 
@@ -26,11 +27,11 @@ from typing import Any, Deque, Dict, List, Optional
 
 from . import __version__
 from .config import PLUGIN_ID, load
-from .engine.bot import DM, Engine, Request, chan_norm
+from .engine.bot import DM, Engine, FollowUp, Request, chan_norm
 from .engine.builtins import BUILTINS, builtin_help
 from .engine.pathresolve import split_chain
 from .engine.schedule import Schedule
-from .engine.templates import render
+from .engine.templates import clamp_bytes, render
 from .engine.usage import parse_window, skip_category, summarize
 from .mesh.companion import Advert, CompanionClient, Message
 from .mesh.correlate import FrameCorrelator, region_of
@@ -57,6 +58,7 @@ CONFIG_POLL_S = 2.0
 RUNTIME_HEARTBEAT_S = 5.0
 CONTACTS_INTERVAL_S = 300
 ANNOUNCE_TICK_S = 15
+MAX_FOLLOW_UPS = 16
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -124,6 +126,7 @@ class Hub:
         self._dirty = asyncio.Event()
         self._stop = asyncio.Event()
         self._ann_minute: Dict[str, str] = {}
+        self._follow_ups: set = set()
 
     # ------------------------------------------------------------ config ----
 
@@ -198,7 +201,7 @@ class Hub:
             self.engine.shortener = None
             logger.error("no link shortener: %s", exc)
         if self.engine.corescope is not None:
-            logger.info("!path links to CoreScope's map at %s (shortener: %s)",
+            logger.info("CoreScope at %s: !path map links and !mpath (shortener: %s)",
                         self.engine.corescope.base,
                         self.engine.shortener.label if self.engine.shortener else "none")
 
@@ -235,6 +238,7 @@ class Hub:
         finally:
             self.tx.stop()
             await self.client.stop()
+            tasks += list(self._follow_ups)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -420,17 +424,49 @@ class Hub:
         st["fires"] += 1
         st["last_fired"] = int(time.time())
         self.counters["replies"] += 1
-        scope = None if req.is_dm else self.engine.reply_scope(req.region)
         for i, text in enumerate([result.reply] + result.extra):
-            self.tx.put(TxJob(
-                text=text,
-                channel_idx=None if req.is_dm else req.channel_idx,
-                dm_prefix=req.sender_prefix if req.is_dm else None,
-                scope=scope, label="%s:%s" % (result.matched, req.region),
-                not_before=time.monotonic() + EXTRA_GAP_S * i,
-            ))
+            self.tx.put(self._reply_job(req, result.matched, text, EXTRA_GAP_S * i))
         self.log_activity("reply", channel=req.channel, region=req.region, sender=req.sender,
                           text=result.reply, detail=result.matched)
+        for follow_up in result.later:
+            self._schedule_follow_up(req, result.matched, follow_up)
+
+    def _reply_job(self, req: Request, cid: str, text: str, delay_s: float = 0.0) -> TxJob:
+        """A frame answering ``req``: back where it came from, in its region."""
+        return TxJob(
+            text=text,
+            channel_idx=None if req.is_dm else req.channel_idx,
+            dm_prefix=req.sender_prefix if req.is_dm else None,
+            scope=None if req.is_dm else self.engine.reply_scope(req.region),
+            label="%s:%s" % (cid, req.region),
+            not_before=time.monotonic() + delay_s,
+        )
+
+    def _schedule_follow_up(self, req: Request, cid: str, follow_up: FollowUp) -> None:
+        if len(self._follow_ups) >= MAX_FOLLOW_UPS:
+            self.log_activity("error", channel=req.channel, sender=req.sender,
+                              detail="%s: follow-up dropped, %d already waiting"
+                              % (cid, MAX_FOLLOW_UPS))
+            return
+        task = asyncio.ensure_future(self._follow_up(req, cid, *follow_up))
+        self._follow_ups.add(task)
+        task.add_done_callback(self._follow_ups.discard)
+
+    async def _follow_up(self, req: Request, cid: str, after_s: float, fn) -> None:
+        """Wait, build the text on a worker thread, and send it like a reply."""
+        if await self._sleep(after_s):
+            return
+        try:
+            text = await asyncio.to_thread(fn)
+        except Exception as exc:
+            logger.error("%s follow-up failed: %s", cid, exc, exc_info=True)
+            return
+        if not text:
+            return
+        text = clamp_bytes(str(text))
+        self.tx.put(self._reply_job(req, cid, text))
+        self.log_activity("reply", channel=req.channel, region=req.region, sender=req.sender,
+                          text=text, detail="%s (follow-up)" % cid)
 
     def _request_from(self, msg: Message) -> Optional[Request]:
         frame = self.correlator.claim(msg)

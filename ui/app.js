@@ -22,7 +22,7 @@ const DEFAULTS = {
   limits: { tx_gap_s: 2.5, tx_max_per_min: 8, user_cooldown_s: 5, reply_in_request_region: true },
   commands: [], announcements: [],
   weather: { units: 'auto', default_country: 'us', contact: '' },
-  corescope: { enabled: false, base_url: '', shortener: 'v.gd', shortener_url: '', shortener_key: '' },
+  corescope: { enabled: false, base_url: '', shortener: 'v.gd', shortener_url: '', shortener_key: '', mpath_wait_s: 30 },
 };
 
 const TABS = [
@@ -249,6 +249,7 @@ function validate() {
   num(c.limits.tx_gap_s, 'tx_gap_s', 0); num(c.limits.tx_max_per_min, 'tx_max_per_min', 0); num(c.limits.user_cooldown_s, 'user_cooldown_s', 0);
   if ((c.corescope.enabled || c.corescope.base_url) && !/^https?:\/\/[^\/\s]+/.test(c.corescope.base_url || '')) e.push('CoreScope base URL must start with http:// or https://');
   if (c.corescope.shortener === 'custom' && !/^https:\/\/[^\/\s?#]+[^\s?#]*$/.test(c.corescope.shortener_url || '')) e.push('Custom shortener URL must be an https:// address');
+  num(c.corescope.mpath_wait_s, '!mpath wait', 5, 300);
   if (c.weather.default_country && !/^[A-Za-z]{2}$/.test(c.weather.default_country)) e.push('Default country must be a 2-letter code such as us, gb or de');
   if (c.node.latitude != null) num(c.node.latitude, 'Latitude', -90, 90);
   if (c.node.longitude != null) num(c.node.longitude, 'Longitude', -180, 180);
@@ -628,7 +629,7 @@ function tabStatus() {
           kv([['Name', s.node_name], ['Pubkey', s.pubkey], ['Position', s.latitude != null && s.longitude != null ? s.latitude + ', ' + s.longitude : null]])),
         h('div', { class: 'card' }, h('h3', { text: 'CoreScope links' }),
           h('p', {}, pill(cfg.corescope.enabled ? 'on' : 'off', cfg.corescope.enabled ? true : undefined)),
-          h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + shortenerLabel(cfg.corescope) : '!path replies with hop hashes only.' }))),
+          h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + shortenerLabel(cfg.corescope) + (hasMpath() ? ' · !mpath on' : '') : '!path replies with hop hashes only; !mpath is silent.' }))),
       updBox,
       h('div', { class: 'card' }, h('h3', { text: 'Counters' }),
         h('div', { class: 'counters' }, Object.entries(c).map(([k, v]) => h('div', { class: 'counter' }, h('b', { text: String(v) }), h('span', { text: k }))))),
@@ -1107,8 +1108,25 @@ function shortenerLabel(cs) {
   if (cs.shortener !== 'custom') return cs.shortener || 'v.gd';
   try { return new URL(cs.shortener_url).host; } catch (_) { return 'custom shortener'; }
 }
+const MPATH_CMD = { id: 'mpath', enabled: true, trigger: '!mpath', description: 'Every route your message took to CoreScope\'s observers (needs CoreScope)', reply: '{mpath}', channels: [], regions: [], dm: null, cooldown_s: 30 };
+function hasMpath() { return cfg.commands.some((m) => m.enabled !== false && /\{mpath\b/.test(m.reply || '')); }
 function tabCoreScope() {
   const cs = cfg.corescope;
+  const mpathNote = h('span', { class: 'hint' });
+  const addMpath = h('button', { type: 'button', class: 'sm', text: 'Add the !mpath command', onclick: () => {
+    if (cfg.commands.some((m) => m.id === 'mpath' || String(m.trigger || '').trim().toLowerCase() === '!mpath')) {
+      toast('A command with ID "mpath" or trigger !mpath already exists. On the Commands tab, enable it and set its reply to {mpath}.', true);
+      return;
+    }
+    cfg.commands.push(clone(MPATH_CMD)); changed(); showMpath();
+    toast('Added !mpath. Save to apply.');
+  } });
+  const showMpath = () => {
+    const has = hasMpath();
+    addMpath.hidden = has;
+    mpathNote.textContent = has ? 'A command using {mpath} is enabled.' : 'No enabled command uses {mpath} yet.';
+  };
+  showMpath();
   const custom = h('div', { class: 'grid' },
     field('Shortener URL', textIn(cs, 'shortener_url', { mono: true, ph: 'https://short.example.org' }), 'Your own service with v.gd\'s API. The bot calls <URL>/create.php?format=simple&key=…&url=… and accepts only links back on this host.'),
     field('Shortener key', textIn(cs, 'shortener_key', { mono: true, type: 'password', ph: 'optional' }), 'Sent as the key parameter. Leave empty if your service needs none.'));
@@ -1118,11 +1136,17 @@ function tabCoreScope() {
     h('div', { class: 'card stack' }, h('h2', { text: 'CoreScope map links' }),
       h('p', { text: '!path answers with the hop count and the hop hashes in travel order. With CoreScope on, it adds a short link to that route on CoreScope\'s map: "@[bob] [3h] 03b9,4216,d924 https://v.gd/AbC123". The map opens the packet by its hash, so it draws the route when CoreScope\'s observers heard the same packet.' }),
       h('p', { class: 'hint', text: 'The shortener gets the full map link (the packet hash and hop hashes); nothing else leaves the node. If shortening fails, !path uses the full link when it fits in one message, otherwise just the hashes. The {pathnames} template token still resolves hops to names and distance, using CoreScope\'s node list when this is on (that sends only the hop hashes to CoreScope).' }),
-      check('Add CoreScope map links to !path', cs, 'enabled'),
+      check('Use CoreScope (map links in !path, and !mpath)', cs, 'enabled'),
       h('div', { class: 'grid' },
         field('CoreScope base URL', textIn(cs, 'base_url', { mono: true, ph: 'https://analyzer.example.net' }), 'The address you open CoreScope at, without /api.'),
         field('Link shortener', sel(cs, 'shortener', SHORTENERS, { onchange: showCustom }), '"Custom" is your own v.gd-compatible service. "None" sends the full link, which only fits short paths.')),
-      custom)) };
+      custom),
+    h('div', { class: 'card stack' }, h('h2', { text: '!mpath' }),
+      h('p', { text: '!mpath shows every route a message took, as CoreScope\'s observers heard it. The bot answers at once ("@[bob] asking CoreScope\'s observers, back in 30s"), waits for the flood to finish, then asks CoreScope for every copy of that packet and replies: "@[bob] 9 routes to 6 observers, 1-5 hops, 2 direct https://v.gd/AbC123". The link opens CoreScope\'s page for the packet, which lists each observer and the path its copy took.' }),
+      h('p', { class: 'hint', text: 'Needs CoreScope on with a base URL. Without it, !mpath stays silent and !help leaves it out. A route is one observer and one distinct hop chain. Only the packet hash is sent to CoreScope; the shortener gets the packet link.' }),
+      h('div', { class: 'grid' },
+        field('Wait before answering (seconds)', numIn(cs, 'mpath_wait_s', { min: 5, max: 300, step: 1 }), '5 to 300. Copies keep reaching observers for tens of seconds after the first; 30 catches most of them.')),
+      h('div', { class: 'row' }, addMpath, mpathNote))) };
 }
 
 // ---------------------------------------------------------------- tab: advanced

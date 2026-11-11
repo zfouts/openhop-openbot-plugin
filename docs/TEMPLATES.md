@@ -45,6 +45,7 @@ It prints the result and its byte count. Roster built-ins see an empty roster.
 | `{path}` | Hop count and hop hashes of the request; with `corescope.enabled`, plus a short link to the route on CoreScope's map | `@[bob] [3h] 03b9,4216,d924 https://v.gd/AbC123` |
 | `{pathbot}` | Alias of `{path}` | same |
 | `{pathnames}` | Resolve the request's hops to names and distance. With `corescope.enabled`, CoreScope's nodes are added to the roster for the lookup | `@[bob] [3h] ~14.2mi RptA>RptB>c3d4?` |
+| `{mpath}` | Needs `corescope.enabled`; renders empty without it, so the command stays silent. Renders an acknowledgement, then `corescope.mpath_wait_s` later the bot sends a second message: every route the request took to CoreScope's observers and a short link to the packet on CoreScope | `@[bob] asking CoreScope's observers, back in 30s`, then `@[bob] 9 routes to 6 observers, 1-5 hops, 2 direct https://v.gd/AbC123` |
 | `{route}` | Raw hop hashes | `a1b2>c3d4` |
 | `{seen NAME}` | When a node was last heard | `RptA (repeater) 5m ago 2h` |
 | `{whois HEX}` | Names for a hop hash prefix (2-8 hex chars, up to 3) | `RptA, RptC` |
@@ -58,7 +59,7 @@ It prints the result and its byte count. Roster built-ins see an empty roster.
 | `{roll 2d6}` / `{roll 100}` | Dice, up to 20 dice | `2d6: 3+4 = 7` |
 | `{pick a, b, c}` | One of the options | `b` |
 | `{8ball}` | Magic 8-ball | `outlook good` |
-| `{help}` | Triggers of enabled commands | `cmds: !path !ping !seen` |
+| `{help}` | Triggers of enabled commands (commands using `{mpath}` only when CoreScope is on) | `cmds: !path !ping !seen` |
 | `{uptime}` | Bot uptime | `up 3d04h` |
 | `{version}` | Plugin version | `openbot 1.0.0` |
 

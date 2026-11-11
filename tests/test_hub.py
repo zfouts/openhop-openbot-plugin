@@ -167,7 +167,8 @@ def test_corescope_rebuilt_when_its_config_changes(tmp_path):
 def test_corescope_ships_disabled():
     from openhop_openbot.config import defaults
     assert defaults()["corescope"] == {"enabled": False, "base_url": "", "shortener": "v.gd",
-                                      "shortener_url": "", "shortener_key": ""}
+                                      "shortener_url": "", "shortener_key": "",
+                                      "mpath_wait_s": 30}
 
 
 def test_unknown_config_sections_are_ignored(tmp_path):
@@ -320,3 +321,101 @@ def test_overlong_node_name_is_a_config_problem(tmp_path):
     h = _hub_with(tmp_path, {"node": {"name": "Liberty Hill Community Repeater Bot"}})
     assert any("node.name" in p and "31" in p for p in h.problems)
     assert not _hub_with(tmp_path, {"node": {"name": "LibertyHillBot"}}).problems
+
+
+# ---------------------------------------------------------------- !mpath ---
+
+class _Short:
+    def __init__(self):
+        self.calls = []
+
+    def shorten(self, url):
+        self.calls.append(url)
+        return "https://v.gd/Mp1"
+
+
+def _with_corescope(hub, rows):
+    from openhop_openbot.services.corescope import CoreScope
+
+    calls = []
+
+    def get(url, headers, timeout):
+        calls.append(url)
+        return 200, {"packet": {"hash": "x"}, "observations": rows}
+
+    hub.engine.corescope = CoreScope("https://cs.example", get=get)
+    hub.engine.shortener = _Short()
+    waits = []
+
+    async def no_wait(secs):
+        waits.append(secs)
+        return False
+
+    hub._sleep = no_wait
+    return calls, waits
+
+
+async def test_mpath_acks_then_follows_up_where_the_request_came_from(hub):
+    import asyncio
+
+    from openhop_openbot.mesh.frames import decode_frame_header, packet_hash
+
+    rows = [{"observer_id": "AA" * 32, "path_json": '["A1B2","C3D4"]', "snr": 3},
+            {"observer_id": "BB" * 32, "path_json": '["A1B2"]', "snr": 9},
+            {"observer_id": "BB" * 32, "path_json": '["E5F6"]', "snr": 1}]
+    calls, waits = _with_corescope(hub, rows)
+    raw, pl = grp_frame("bob: !mpath", path=bytes.fromhex("a1b2c3d4"), region="#tx-dfw")
+    await hub._on_raw_frame(raw, 6.0, -90)
+    await hub._on_message(channel_msg("bob: !mpath", pl))
+    assert [j.text for j in hub.tx._jobs] == ["@[bob] asking CoreScope's observers, back in 30s"]
+    await asyncio.gather(*list(hub._follow_ups))
+    pkt = packet_hash(decode_frame_header(raw))
+    assert waits == [30] and calls == ["https://cs.example/api/packets/" + pkt.lower()]
+    assert hub.engine.shortener.calls == ["https://cs.example/#/packet/" + pkt.upper()]
+    ack, follow = hub.tx._jobs
+    assert follow.text == "@[bob] 3 routes to 2 observers, 1-2 hops https://v.gd/Mp1"
+    assert follow.channel_idx == ack.channel_idx == 1
+    assert follow.scope == ack.scope == region_key("#tx-dfw")
+    assert hub.activity[-1]["detail"] == "mpath (follow-up)"
+    assert not hub._follow_ups
+
+
+async def test_mpath_is_silent_without_corescope(hub):
+    await deliver(hub, "bob: !mpath", path=bytes.fromhex("a1b2"))
+    assert not hub.tx._jobs and not hub._follow_ups
+    assert hub.activity[-1]["kind"] == "skip"
+
+
+async def test_mpath_dry_run_never_schedules(hub):
+    _with_corescope(hub, [])
+    res = await hub.execute("test", {"text": "!mpath", "channel": "#bot"})
+    assert res["matched"] == "mpath" and "no packet hash" in res["reply"]
+    assert not hub._follow_ups and not hub.tx._jobs
+
+
+async def test_follow_ups_end_with_the_hub(hub):
+    import asyncio
+
+    _with_corescope(hub, [])
+    del hub._sleep                                # the real, stop-aware sleep
+    await deliver(hub, "bob: !mpath", path=bytes.fromhex("a1b2"))
+    assert len(hub._follow_ups) == 1
+    hub.stop()
+    await asyncio.wait_for(asyncio.gather(*list(hub._follow_ups)), 2)
+    assert len(hub.tx._jobs) == 1                 # the ack only
+
+
+async def test_follow_ups_are_capped(hub, monkeypatch):
+    import asyncio
+
+    import openhop_openbot.hub as hub_mod
+
+    monkeypatch.setattr(hub_mod, "MAX_FOLLOW_UPS", 1)
+    _with_corescope(hub, [])
+    del hub._sleep
+    await deliver(hub, "bob: !mpath", path=bytes.fromhex("a1b2"))
+    await deliver(hub, "eve: !mpath", path=bytes.fromhex("a1b2"))
+    assert len(hub._follow_ups) == 1
+    assert "follow-up dropped" in hub.activity[-1]["detail"]
+    hub.stop()
+    await asyncio.gather(*list(hub._follow_ups))

@@ -3,9 +3,11 @@
 Each takes ``(ctx, arg)`` and returns a short string. ``ctx`` carries the
 request (sender, args, channel, region, hop chain, snr), the node's own
 state, the local ``store``, and the ``weather`` (Open-Meteo), ``geocoder``
-(Nominatim) and optional ``corescope`` (CoreScope hop lookup) clients.
-Built-ins run on a worker thread, so blocking HTTP is fine; they must not
-touch asyncio.
+(Nominatim) and optional ``corescope`` (CoreScope) clients. Built-ins run on
+a worker thread, so blocking HTTP is fine; they must not touch asyncio. A
+built-in that answers later appends ``(after_s, fn)`` to ``ctx["later"]``;
+the hub runs ``fn`` on a worker thread ``after_s`` seconds on and sends what
+it returns where the reply went.
 
 Built-ins answer from what this one radio has heard:
 
@@ -15,6 +17,9 @@ Built-ins answer from what this one radio has heard:
   this node's roster (plus CoreScope's nodes, when configured).
 * ``{seen}``, ``{stats}``, ``{top_relays}`` and the rest count only what this
   radio heard.
+
+The exception is ``{mpath}``, which only works with CoreScope: it answers
+later with what every CoreScope observer heard of the request (engine/mpath.py).
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .. import __version__
-from . import pathresolve
+from . import mpath, pathresolve
 from .templates import MAX_TEXT_BYTES, clamp_bytes
 
 log = logging.getLogger("openbot.builtins")
@@ -246,6 +251,27 @@ def _with_corescope(corescope, hops: List[str], local):
     return candidates
 
 
+def fn_mpath(ctx: Dict[str, Any], arg: Optional[str]) -> str:
+    """Acknowledge now, and queue the CoreScope lookup that answers later.
+
+    Empty without CoreScope, so the command stays silent (and `{help}` leaves
+    it out) until CoreScope is turned on. Needs the request frame's packet
+    hash, which is what CoreScope files every copy under."""
+    cs = ctx.get("corescope")
+    if cs is None:
+        return ""
+    sender = ctx.get("sender") or "?"
+    pkt, later = ctx.get("packet_hash"), ctx.get("later")
+    if not pkt or later is None:
+        return "@[%s] can't trace that copy: no packet hash" % sender
+    wait = mpath.wait_s(ctx.get("cfg") or {})
+    if not ctx.get("_mpath_queued"):
+        ctx["_mpath_queued"] = True
+        shortener = ctx.get("shortener")
+        later.append((wait, lambda: mpath.report(cs, shortener, sender, pkt)))
+    return mpath.ack(sender, wait)
+
+
 TOOK_MAX_S = 3600
 
 
@@ -387,8 +413,14 @@ def fn_pick(ctx, arg):
     return random.choice(opts) if opts else "pick a, b, c"
 
 
+def needs_corescope(cmd: Dict[str, Any]) -> bool:
+    return "{mpath" in str(cmd.get("reply") or "")
+
+
 def fn_help(ctx, arg):
-    cmds = [c.get("trigger", "") for c in ctx.get("commands") or [] if c.get("trigger")]
+    off = ctx.get("corescope") is None
+    cmds = [c.get("trigger", "") for c in ctx.get("commands") or []
+            if c.get("trigger") and not (off and needs_corescope(c))]
     if not cmds:
         return "no commands"
     out = "cmds: " + " ".join(cmds)
@@ -428,6 +460,7 @@ BUILTINS = {
     "path": fn_path,
     "pathbot": fn_path,
     "pathnames": fn_pathnames,
+    "mpath": fn_mpath,
     "took": fn_took,
     "route": fn_route,
     # roster
@@ -468,6 +501,9 @@ HELP = {
     "pathbot": "Alias of {path}",
     "pathnames": "Resolve the request's hop chain to names + distance; with CoreScope"
                  " configured, against every node it has heard",
+    "mpath": "Needs CoreScope (silent without it): acknowledges, then after"
+             " corescope.mpath_wait_s answers with every route the request took to"
+             " CoreScope's observers and a short link to the packet",
     "took": "Seconds from the sender's message timestamp to when this node heard it"
             " (? if the sender's clock is off)",
     "route": "Raw hop hash chain, e.g. a1b2>c3d4",

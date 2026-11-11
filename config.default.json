@@ -61,6 +61,17 @@
       "cooldown_s": 10
     },
     {
+      "id": "mpath",
+      "enabled": true,
+      "trigger": "!mpath",
+      "description": "Every route your message took to CoreScope's observers (needs CoreScope)",
+      "reply": "{mpath}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
+    },
+    {
       "id": "seen",
       "enabled": true,
       "trigger": "!seen",
@@ -127,6 +138,7 @@
     "base_url": "",
     "shortener": "v.gd",
     "shortener_url": "",
-    "shortener_key": ""
+    "shortener_key": "",
+    "mpath_wait_s": 30
   }
 }

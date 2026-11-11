@@ -11,6 +11,7 @@ repeater, with no server.
 |---|---|
 | `!path` | The hops your message took, with an optional map link |
 | `!ping` | Hop count and time in flight |
+| `!mpath` | Every route your message took to CoreScope's observers, with a link (needs CoreScope) |
 | `!seen <name>` | When a node was last heard |
 | `!whois <hash>` | Node names for a hop hash |
 | `!stats` | Roster and traffic counts |
