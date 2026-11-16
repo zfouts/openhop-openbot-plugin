@@ -41,7 +41,7 @@ log = logging.getLogger("openbot.builtins")
 # the frame limit, so a long sender name costs the prose, not the fix.
 HASH_HINT_COOLDOWN_S = 900
 HASH_HINT = ("1-byte path hashes leave hops ambiguous. Please enable 2-byte"
-             " (companion Settings > Experimental) or CLI: set path.hash.mode 1")
+             " (Settings > Default Path Hash Size) or CLI: set path.hash.mode 1")
 HASH_HINT_SHORT = "please enable 2-byte path hashes. CLI: set path.hash.mode 1"
 
 EIGHTBALL = ["it is certain", "without a doubt", "most likely", "outlook good",
