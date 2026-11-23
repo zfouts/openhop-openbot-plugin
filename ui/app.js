@@ -655,6 +655,7 @@ function inheritChannels() {
 }
 const inheritRegions = () => (cfg.scope.regions.length ? cfg.scope.regions.join(', ') : 'any region');
 
+const ABOUT_CMD = { id: 'about', enabled: true, trigger: '!about', description: 'What this bot is and the version it runs', reply: '{about}', channels: [], regions: [], dm: null, cooldown_s: 30 };
 function tabCommands() {
   const list = h('div');
   const fires = new Map();
@@ -730,6 +731,7 @@ function tabCommands() {
   }
   function renderList() {
     fires.clear();
+    addAbout.hidden = cfg.commands.some((m) => /\{about\b/.test(m.reply || ''));
     list.replaceChildren(...(cfg.commands.length ? cfg.commands.map(card) : [h('p', { class: 'muted', text: 'No commands defined. Add one to get started.' })]));
   }
   function refresh() { fires.forEach((f) => f()); renderBuiltins(); }
@@ -739,6 +741,16 @@ function tabCommands() {
     const m = { id: 'cmd' + n, enabled: true, trigger: '!cmd' + n, description: '', reply: '', channels: [], regions: [], dm: null, cooldown_s: 10 };
     cfg.commands.push(m); openCmds.add(m); changed(); renderList();
     list.lastElementChild.querySelector('input').focus();
+  } });
+  // Saved command lists replace the defaults, so configs saved before !about existed lack it.
+  const addAbout = h('button', { type: 'button', class: 'sm', text: 'Add the !about command', onclick: () => {
+    if (cfg.commands.some((m) => m.id === 'about' || String(m.trigger || '').trim().toLowerCase() === '!about')) {
+      toast('A command with ID "about" or trigger !about already exists. Set its reply to {about}.', true);
+      return;
+    }
+    const m = clone(ABOUT_CMD);
+    cfg.commands.push(m); openCmds.add(m); changed(); renderList();
+    toast('Added !about. Save to apply.');
   } });
 
   // test box
@@ -766,7 +778,7 @@ function tabCommands() {
   const tin = (k, lbl, o = {}) => { const el = h('input', { class: o.mono ? 'mono' : '', placeholder: o.ph, autocomplete: 'off' }); el.value = T[k]; el.addEventListener('input', () => { T[k] = el.value; }); return field(lbl, el, o.hint); };
 
   const el = h('div', {},
-    h('div', { class: 'row', style: 'margin-bottom:8px' }, h('h2', { class: 'grow', text: 'Commands' }), add),
+    h('div', { class: 'row', style: 'margin-bottom:8px' }, h('h2', { class: 'grow', text: 'Commands' }), addAbout, add),
     h('details', { class: 'card' }, h('summary', { text: 'Template reference (click a token to insert at the cursor in the reply you last edited)' }), builtins,
       h('p', { class: 'hint', style: 'margin-top:8px', text: 'Other tokens: {sender} {hops} {snr} {gateway} {region_tag} {args}. Full list in docs/TEMPLATES.md.' })),
     list,
