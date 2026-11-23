@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from openhop_openbot.engine.builtins import BUILTINS
 from openhop_openbot.hub import Hub, split_sender
 from openhop_openbot.mesh.frames import region_key
 
@@ -95,12 +96,23 @@ async def test_mailbox_test_and_runtime(hub, tmp_path):
     assert {b["name"] for b in rt["builtins"]} >= {"path", "seen"}
 
 
-async def test_txqueue_paces_and_sends(hub):
+async def test_one_byte_path_gets_one_reply(hub):
+    await deliver(hub, "bob: !path", path=bytes.fromhex("a1"), hash_size=1)
+    assert [j.text for j in hub.tx._jobs] == ["@[bob] [1h] a1"]
+
+
+async def test_txqueue_paces_and_sends(hub, monkeypatch):
     import asyncio
 
+    def two_parts(ctx, arg):
+        ctx["extra"].append("second part")
+        return "first part"
+
+    monkeypatch.setitem(BUILTINS, "two_parts", two_parts)
+    hub.engine.cfg["commands"].append({"id": "two", "trigger": "!two", "reply": "{two_parts}"})
     hub.tx.gap_s = 0.05
-    await deliver(hub, "bob: !path", path=bytes.fromhex("a1"), hash_size=1)
-    assert len(hub.tx._jobs) == 2                          # reply + 1-byte hint
+    await deliver(hub, "bob: !two")
+    assert len(hub.tx._jobs) == 2                          # reply + extra
     hub.tx._jobs[1].not_before = 0
     task = asyncio.create_task(hub.tx.run())
     for _ in range(50):
@@ -110,7 +122,7 @@ async def test_txqueue_paces_and_sends(hub):
     hub.tx.stop()
     await task
     assert [s[0] for s in hub.client.sent] == ["chan", "chan"]
-    assert "path.hash.mode" in hub.client.sent[1][2]
+    assert [s[2] for s in hub.client.sent] == ["first part", "second part"]
 
 
 def test_split_sender():

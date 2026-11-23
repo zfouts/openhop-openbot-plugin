@@ -191,15 +191,12 @@ def test_pathnames_resolves_names_and_distance():
     assert len(out.encode()) <= 160
 
 
-def test_path_direct_unresolved_and_hint():
+def test_path_direct_and_one_byte_hashes():
     eng, store = make()
     assert "direct" in eng.handle(req("!path", hops_n=0, hops=[])).reply
     res = eng.handle(req("!path", sender="z", hops=["ff", "ee"], hash_size=1))
     assert res.reply == "@[z] [2h] ff,ee"
-    assert res.extra and "path.hash.mode 1" in res.extra[0]
-    # the nudge is rate-limited per requester
-    eng.cfg["commands"][0]["cooldown_s"] = 0
-    assert not eng.handle(req("!path", sender="z", hops=["ff"], hash_size=1)).extra
+    assert res.extra == []                     # no second message about hash size
 
 
 def test_seen_whois_stats_help():
