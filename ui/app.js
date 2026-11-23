@@ -907,28 +907,35 @@ function tabScope() {
     return h('label', { class: 'radio' }, el, h('span', {}, h('b', { text: label }), h('span', { class: 'muted', text: ' ' + hint })));
   };
 
+  // Use matches names exactly: a region's key depends on its case. Answer
+  // matches the way the bot's scope check does, ignoring case.
   const inList = (arr, name) => arr.findIndex((x) => regionKey(x) === name);
+  const lc = (v) => regionKey(v).toLowerCase();
+  const answerIdx = (name) => s.regions.reduce((a, x, i) => (x !== '*' && lc(x) === lc(name) ? [...a, i] : a), []);
+  const usedAnyCase = (name) => cfg.regions.some((x) => lc(x) === lc(name));
+  const dropAnswers = (idx) => { idx.slice().reverse().forEach((j) => s.regions.splice(j, 1)); };
   const setUse = (name, on) => {
     const i = inList(cfg.regions, name);
     if (on && i < 0) cfg.regions.push(name);
     if (!on && i >= 0) {
-      const j = inList(s.regions, name);
-      if (j >= 0 && s.regions.length === 1) {
+      // Answers for it only go when no other spelling of the name stays in use.
+      const orphaned = cfg.regions.filter((x, k) => k !== i && lc(x) === lc(name)).length ? [] : answerIdx(name);
+      if (orphaned.length && orphaned.length === s.regions.length) {
         toast(name + ' is the only region the bot answers in. Tick another under Answer first, or choose "Any region".', true);
         return false;
       }
-      if (j >= 0) s.regions.splice(j, 1);
+      dropAnswers(orphaned);
       cfg.regions.splice(i, 1);
       scopeUI.extra.add(name);
     }
     changed(); sync(); return true;
   };
   const setAnswer = (name, on) => {
-    const j = name === '*' ? s.regions.indexOf('*') : inList(s.regions, name);
-    if (on && j < 0) s.regions.push(name);
-    if (!on && j >= 0) {
-      if (s.regions.length === 1) { toast('Keep at least one ticked, or choose "Any region".', true); return false; }
-      s.regions.splice(j, 1);
+    const idx = name === '*' ? (s.regions.includes('*') ? [s.regions.indexOf('*')] : []) : answerIdx(name);
+    if (on && !idx.length) s.regions.push(name);
+    if (!on && idx.length) {
+      if (idx.length === s.regions.length) { toast('Keep at least one ticked, or choose "Any region".', true); return false; }
+      dropAnswers(idx);
     }
     changed(); sync(); return true;
   };
@@ -960,12 +967,14 @@ function tabScope() {
     const heard = new Map(((R && R.heard) || []).map((x) => [x.name, x]));
     const csRows = new Map((cs.regions || []).map((x) => [x.name, x]));
     const watching = new Set((R && R.watching) || []);
-    const names = new Set([...cfg.regions, ...s.regions.filter((r) => r !== '*')].map(regionKey));
+    const names = new Set(cfg.regions.map(regionKey));
+    // An answered name with no region in use under any spelling gets its own row (it never matches).
+    s.regions.filter((r) => r !== '*' && !usedAnyCase(r)).forEach((r) => names.add(regionKey(r)));
     [...heard.keys(), ...csRows.keys(), ...scopeUI.extra].forEach((n) => names.add(n));
     return [...names].filter(Boolean).map((name) => {
       const hd = heard.get(name) || null;
-      return { name, used: inList(cfg.regions, name) >= 0, answered: inList(s.regions, name) >= 0, heard: hd, cs: csRows.get(name) || null,
-        watching: watching.has(name), live: !!(hd && hd.packets > 0) };
+      return { name, used: inList(cfg.regions, name) >= 0, usedAnyCase: usedAnyCase(name), answered: answerIdx(name).length > 0,
+        heard: hd, cs: csRows.get(name) || null, watching: watching.has(name), live: !!(hd && hd.packets > 0) };
     }).sort((a, b) => (b.used - a.used) || ((b.heard && b.heard.verified ? 1 : 0) - (a.heard && a.heard.verified ? 1 : 0)) || (b.live - a.live)
       || ((b.cs ? b.cs.packets : -1) - (a.cs ? a.cs.packets : -1)) || ((b.cs ? b.cs.repeaters : 0) - (a.cs ? a.cs.repeaters : 0)) || a.name.localeCompare(b.name));
   }
@@ -998,7 +1007,24 @@ function tabScope() {
     const csOn = !!cfg.corescope.enabled;
     const all = rows();
     const only = mode() === 'only';
-    const sig = JSON.stringify([R, cfg.regions, s.regions, scopeUI.filter, scopeUI.showAll, [...scopeUI.extra], scopeUI.refreshing, csOn, rtState, Math.floor(Date.now() / 60000)]);
+    const f = scopeUI.filter.trim().toLowerCase();
+    const shown = f ? all.filter((r) => r.name.toLowerCase().includes(f)) : all;
+    const key = (r) => r.used || r.answered || r.live || scopeUI.extra.has(r.name);
+    let list = shown;
+    let hidden = 0;
+    if (!f && !scopeUI.showAll) {
+      const rest = shown.filter((r) => !key(r));
+      const keep = new Set(rest.slice(0, Math.max(0, ROWS_COLLAPSED - shown.filter(key).length)).map((r) => r.name));
+      list = shown.filter((r) => key(r) || keep.has(r.name));
+      hidden = shown.length - list.length;
+    }
+    const unknownSeen = Number(((rt && rt.regions_seen) || {})['?'] || 0);
+    // Built from what is displayed, so the 3 s poll does not replace the table
+    // (and swallow a click) whenever a packet bumps a count nobody sees.
+    const sig = JSON.stringify([list.map((r) => [r.name, r.used, r.usedAnyCase, r.answered, r.watching,
+      r.heard && [r.heard.verified, r.heard.packets, ago(r.heard.last_heard)], r.cs && [r.cs.packets, r.cs.repeaters]]),
+    hidden, all.length, only, csOn, !!R, rtState === 'ok', cs.error || null, cs.error_at ? ago(cs.error_at) : null, cs.fetched_at ? ago(cs.fetched_at) : null,
+    cs.partial || null, (cs.regions || []).length, s.regions.includes('*'), scopeUI.filter, scopeUI.showAll, scopeUI.refreshing, only && unknownSeen]);
     if (!force && regionsBox._sig === sig) return;
     regionsBox._sig = sig;
     const focusKey = document.activeElement && regionsBox.contains(document.activeElement) ? document.activeElement.getAttribute('data-k') : null;
@@ -1014,29 +1040,17 @@ function tabScope() {
     else status = h('span', { class: 'muted', text: plural((cs.regions || []).length, 'region') + ' from CoreScope, updated ' + ago(cs.fetched_at) + '.' + (cs.partial ? ' Repeater counts were unavailable (' + cs.partial + ').' : '') });
     statusBox.replaceChildren(h('span', {}, status));
 
-    const f = scopeUI.filter.trim().toLowerCase();
-    const shown = f ? all.filter((r) => r.name.toLowerCase().includes(f)) : all;
-    const key = (r) => r.used || r.answered || r.live || scopeUI.extra.has(r.name);
-    let list = shown;
-    let hidden = 0;
-    if (!f && !scopeUI.showAll) {
-      const rest = shown.filter((r) => !key(r));
-      const keep = new Set(rest.slice(0, Math.max(0, ROWS_COLLAPSED - shown.filter(key).length)).map((r) => r.name));
-      list = shown.filter((r) => key(r) || keep.has(r.name));
-      hidden = shown.length - list.length;
-    }
-
     const head = ['Use', 'Region', 'Heard here', ...(csOn ? ['CoreScope (7 days)'] : []), ...(only ? ['Answer'] : [])];
     const tips = { 'Heard here': 'Packets this radio heard in the region over the last 7 days. Verified: at least 3 separate packets, more than chance could explain.',
       'CoreScope (7 days)': 'Packets CoreScope\'s observers matched to the region, and how many repeaters say they carry it.' };
     const body = list.map((r) => h('tr', { class: r.used ? '' : 'off' },
       h('td', { class: 'c-check c-use' }, box(r.used, 'Use ' + r.name, 'use:' + r.name, (on) => setUse(r.name, on))),
       h('th', { scope: 'row', class: 'mono rg-name' }, r.name,
-        r.answered && !r.used ? h('span', { class: 'sub warn-text', text: 'Never matches: tick Use' }) : null),
+        r.answered && !r.usedAnyCase ? h('span', { class: 'sub warn-text', text: 'Never matches: tick Use' }) : null),
       h('td', { class: 'c-heard', 'data-label': 'Heard here' }, heardCell(r)),
       csOn ? h('td', { class: 'c-cs', 'data-label': 'CoreScope' }, csCell(r, csOn)) : null,
       only ? h('td', { class: 'c-check c-ans', 'data-label': 'Answer' }, box(r.answered, 'Answer in ' + r.name, 'ans:' + r.name, (on) => setAnswer(r.name, on),
-        { disabled: !r.used && !r.answered, title: !r.used ? 'Tick Use first: the bot cannot tell when a message is in this region.' : null })) : null));
+        { disabled: !r.usedAnyCase && !r.answered, title: !r.usedAnyCase ? 'Tick Use first: the bot cannot tell when a message is in this region.' : null })) : null));
     if (only && (!f || 'no region'.includes(f) || f === '*')) {
       body.push(h('tr', { class: 'special' },
         h('td', { class: 'c-check c-use' }),
@@ -1045,12 +1059,11 @@ function tabScope() {
         h('td', { class: 'c-check c-ans', 'data-label': 'Answer' }, box(s.regions.includes('*'), 'Answer messages with no region', 'ans:*', (on) => setAnswer('*', on)))));
     }
 
-    let table;
-    if (!all.length) {
-      table = h('div', { class: 'empty' }, h('p', {}, h('b', { text: 'No regions yet.' })),
-        h('p', { class: 'muted', text: csOn ? 'Refresh from CoreScope to list the regions it knows, or add one below.' : 'Add the regions your mesh uses below, or turn on CoreScope to list the ones it knows.' }));
-    } else if (!body.length) {
-      table = h('p', { class: 'muted pad-s', text: 'No region matches "' + scopeUI.filter + '".' });
+    let table = null;
+    const empty = !all.length ? h('div', { class: 'empty' }, h('p', {}, h('b', { text: 'No regions yet.' })),
+      h('p', { class: 'muted', text: csOn ? 'Refresh from CoreScope to list the regions it knows, or add one below.' : 'Add the regions your mesh uses below, or turn on CoreScope to list the ones it knows.' })) : null;
+    if (!body.length) {
+      if (all.length) table = h('p', { class: 'muted pad-s', text: 'No region matches "' + scopeUI.filter + '".' });
     } else {
       table = h('div', { class: 'tablewrap' }, h('table', { class: 'rg-table' + (only ? ' with-answer' : '') },
         h('thead', {}, h('tr', {}, head.map((t) => h('th', { scope: 'col', class: t === 'Use' || t === 'Answer' ? 'c-check' : '', title: tips[t] || null, text: t })))),
@@ -1064,8 +1077,10 @@ function tabScope() {
       h('fieldset', { class: 'modes' }, h('legend', { text: 'Answer requests from' }),
         radio('any', 'Any region', '(and from messages with no region)'),
         radio('only', 'Only the regions ticked under Answer', '(requests that arrive direct-routed are always answered)')),
-      all.length > ROWS_COLLAPSED ? h('div', { class: 'row rg-tools' }, filterIn) : null,
-      table, more ? h('p', {}, more) : null].filter(Boolean));
+      only ? h('p', { class: 'hint' }, 'A request in a region the bot can\'t recognise (not ticked under Use) is not answered in this mode'
+        + (unknownSeen ? ': ' + plural(unknownSeen, 'request') + ' arrived like that since the bot started.' : '.')) : null,
+      all.length > ROWS_COLLAPSED || scopeUI.filter ? h('div', { class: 'row rg-tools' }, filterIn) : null,
+      empty, table, more ? h('p', {}, more) : null].filter(Boolean));
     if (focusKey) {
       const el = [...regionsBox.querySelectorAll('[data-k]')].find((x) => x.getAttribute('data-k') === focusKey);
       if (el) el.focus();

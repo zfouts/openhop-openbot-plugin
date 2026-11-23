@@ -172,13 +172,18 @@ and any the radio has heard. Ticking **Use** adds a region to `regions`.
 **Answer requests from** picks between any region (`scope.regions` empty) and
 only the regions ticked under **Answer** (`scope.regions` lists them, plus `*`
 for messages with no region). Switching to the second ticks every region in
-use and `*`, so nothing changes until you untick one.
+use and `*`, so those keep being answered. A request in a region the bot can't
+recognise (`?`: one not ticked under **Use**) is no longer answered; the tab
+shows how many arrived like that since the bot started. Answer matches region
+names ignoring case, as the bot's scope check does; **Use** does not, because
+a region's key depends on its case.
 
 **Heard here** is what this radio heard over the last 7 days. The bot tests
 every scoped packet it hears (any type, not just chat) against the regions in
 use and against up to 64 of the regions CoreScope lists, so a region can show
 as live before you tick it. Each packet counts once however many relays repeat
-it. **Verified** means at least 3 separate packets, and more than chance would
+it, and the bot's own messages and adverts relayed back are not counted.
+**Verified** means at least 3 separate packets, and more than chance would
 explain: a region code is only 16 bits, so on a busy mesh any region matches
 an unrelated packet now and then. **Heard, not confirmed** means some matches
 but not enough to rule chance out. Counts are kept 30 days in `openbot.db`.

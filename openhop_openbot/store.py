@@ -568,10 +568,13 @@ class Store:
                        ON CONFLICT (day, region) DO UPDATE
                        SET packets = packets + excluded.packets,
                            last = max(last, excluded.last)""", rows)
+                self._db.execute("COMMIT")
             except Exception:
-                self._db.execute("ROLLBACK")
+                # Never leave the shared autocommit connection inside a
+                # transaction: every later write would join it, uncommitted.
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
                 raise
-            self._db.execute("COMMIT")
 
     def region_counts(self, since: float) -> Dict[str, Dict[str, Any]]:
         """Per region: packets heard on days from ``since``'s day on, and when

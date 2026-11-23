@@ -19,6 +19,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -87,6 +88,7 @@ SCOPED_SEEN_S = 120.0
 CS_REGIONS_EVERY_S = 6 * 3600
 CS_REGIONS_RETRY_S = 15 * 60
 CS_REGIONS_TICK_S = 60.0
+CS_REGIONS_MAX = 200
 
 
 def _public_secret() -> bytes:
@@ -132,6 +134,8 @@ class Hub:
         self.cs_regions_path = data_dir / "corescope_regions.json"
         self.cs_regions: Dict[str, Any] = self._load_cs_regions()
         self._cs_lock = asyncio.Lock()
+        self._cs_seq = 0                                  # fetches finished
+        self._cs_last: Optional[tuple] = None             # (ok, result or error) of the last one
         self.node: Dict[str, Any] = {"started_at": self.started_at}
         self.engine = Engine(self.cfg, self.store, node=self.node)
         self._build_services()
@@ -273,25 +277,40 @@ class Hub:
     # ------------------------------------------------- CoreScope regions ----
 
     def _load_cs_regions(self) -> Dict[str, Any]:
-        """The last region list fetched from CoreScope, from data/. A missing or
-        unreadable file is an empty cache: the next fetch rewrites it."""
+        """The last region list fetched from CoreScope, from data/. A missing,
+        unreadable or malformed file is an empty cache: the next fetch
+        rewrites it. Only known fields of the right type are kept."""
         try:
             data = json.loads(self.cs_regions_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
         if not isinstance(data, dict):
             return {}
-        def n(v: Any) -> int:
+
+        def count(v: Any) -> int:
             return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
 
-        rows = []
-        for r in data.get("regions") or []:
+        def when(v: Any) -> Optional[int]:
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            return int(v) if ok else None
+
+        def text(v: Any) -> Optional[str]:
+            return v[:300] if isinstance(v, str) and v else None
+
+        rows, seen = [], set()
+        raw = data.get("regions")
+        for r in raw if isinstance(raw, list) else []:
             name = region_name(r.get("name")) if isinstance(r, dict) else None
-            if name is not None:
-                rows.append({"name": name, "packets": n(r.get("packets")),
-                             "repeaters": n(r.get("repeaters"))})
-        data["regions"] = rows
-        return data
+            if name is not None and name not in seen:
+                seen.add(name)
+                rows.append({"name": name, "packets": count(r.get("packets")),
+                             "repeaters": count(r.get("repeaters"))})
+            if len(rows) >= CS_REGIONS_MAX:
+                break
+        return {"base_url": text(data.get("base_url")), "attempt_at": when(data.get("attempt_at")),
+                "fetched_at": when(data.get("fetched_at")), "error": text(data.get("error")),
+                "error_at": when(data.get("error_at")), "partial": text(data.get("partial")),
+                "regions": rows}
 
     def _cs_regions_for(self, cs: Any) -> Dict[str, Any]:
         """The cache, when it came from this CoreScope; else nothing."""
@@ -307,19 +326,33 @@ class Hub:
         now = time.time() if now is None else now
         cache = self._cs_regions_for(cs)
         at = cache.get("attempt_at")
-        if not isinstance(at, (int, float)):
-            return True
+        if not isinstance(at, (int, float)) or not math.isfinite(at) or at > now:
+            return True                 # never tried, or a time that cannot be right
         return now - at >= (CS_REGIONS_RETRY_S if cache.get("error") else CS_REGIONS_EVERY_S)
 
-    async def refresh_corescope_regions(self) -> Dict[str, Any]:
-        """Fetch CoreScope's region list now, cache it, and start watching for
-        its regions on air. Raises ValueError when CoreScope is off or the
-        fetch fails; a failure keeps the last list and records why."""
+    async def refresh_corescope_regions(self, force: bool = True) -> Optional[Dict[str, Any]]:
+        """Fetch CoreScope's region list, cache it, and start watching for its
+        regions on air. Returns ``{"regions": n, "partial": ...}``.
+
+        ``force`` (the Refresh button) always fetches; otherwise (the
+        background loop) it fetches only when one is due and returns None
+        when not. A call that waited while another fetch ran takes that
+        fetch's outcome rather than asking CoreScope again. Raises ValueError
+        when CoreScope is off or the fetch fails; a failure keeps the last
+        list and records why."""
         cs = self.engine.corescope
         if cs is None:
             raise ValueError("CoreScope is off. Turn it on, with a base URL, on the "
                              "CoreScope tab.")
+        seq = self._cs_seq
         async with self._cs_lock:
+            if self._cs_seq != seq and self._cs_last is not None:
+                ok, outcome = self._cs_last
+                if ok:
+                    return outcome
+                raise ValueError(outcome)
+            if not force and not self._cs_regions_due(cs):
+                return None
             now = int(time.time())
             cache = dict(self._cs_regions_for(cs)) or {"base_url": cs.base, "regions": []}
             cache["attempt_at"] = now
@@ -329,14 +362,18 @@ class Hub:
                 cache.update(error=str(exc), error_at=now)
                 self._save_cs_regions(cache)
                 logger.warning("CoreScope region list failed: %s", exc)
-                raise ValueError("CoreScope region list failed: %s" % exc) from exc
+                msg = "CoreScope region list failed: %s" % exc
+                self._cs_seq, self._cs_last = self._cs_seq + 1, (False, msg)
+                raise ValueError(msg) from exc
             cache = {"base_url": cs.base, "attempt_at": now, "fetched_at": now,
                      "error": None, "error_at": None, "partial": res["partial"],
                      "regions": res["regions"]}
             self._save_cs_regions(cache)
             logger.info("CoreScope knows %d regions%s", len(res["regions"]),
                         " (%s)" % res["partial"] if res["partial"] else "")
-            return {"regions": len(res["regions"]), "partial": res["partial"]}
+            out = {"regions": len(res["regions"]), "partial": res["partial"]}
+            self._cs_seq, self._cs_last = self._cs_seq + 1, (True, out)
+            return out
 
     def _save_cs_regions(self, cache: Dict[str, Any]) -> None:
         self.cs_regions = cache
@@ -349,10 +386,13 @@ class Hub:
 
     async def _corescope_loop(self) -> None:
         while not self._stop.is_set():
-            cs = self.engine.corescope
-            if cs is not None and self._cs_regions_due(cs):
-                with contextlib.suppress(ValueError):
-                    await self.refresh_corescope_regions()
+            if self.engine.corescope is not None:
+                try:
+                    await self.refresh_corescope_regions(force=False)
+                except ValueError:
+                    pass                    # logged and recorded by the refresh
+                except Exception as exc:
+                    logger.error("CoreScope region refresh failed: %s", exc, exc_info=True)
             if await self._sleep(CS_REGIONS_TICK_S):
                 return
 
@@ -519,15 +559,6 @@ class Hub:
         frame = None
         with contextlib.suppress(Exception):
             frame = self.correlator.remember(raw, snr, rssi)
-        hdr = frame.hdr if frame is not None else None
-        if hdr is None:
-            with contextlib.suppress(Exception):
-                hdr = decode_frame_header(raw)
-        if hdr is not None and hdr.get("transport_codes"):
-            try:
-                self.regionwatch.observe(hdr)      # runtime.json picks it up on its heartbeat
-            except Exception as exc:
-                logger.warning("region count failed: %s", exc)
         if frame is not None and frame.type == PAYLOAD_TYPE_GRP_TXT \
                 and frame.hdr.get("transport_codes"):
             now = time.monotonic()
@@ -539,6 +570,15 @@ class Hub:
             adv = decode_advert_frame(raw)
         except Exception:
             adv = None
+        hdr = frame.hdr if frame is not None else None
+        if hdr is None:
+            with contextlib.suppress(Exception):
+                hdr = decode_frame_header(raw)
+        if hdr is not None and hdr.get("transport_codes") and not self._is_own(hdr, adv):
+            try:
+                self.regionwatch.observe(hdr)      # runtime.json picks it up on its heartbeat
+            except Exception as exc:
+                logger.warning("region count failed: %s", exc)
         if adv is not None:
             hs = adv.get("hash_size") or 1
             path = adv.get("path") or b""
@@ -551,6 +591,26 @@ class Hub:
             )
             if hops:
                 self.store.record_chain(hops)
+
+    def _is_own(self, hdr: Dict[str, Any], adv: Optional[Dict[str, Any]]) -> bool:
+        """The bot's own packet, relayed back: its advert, or a channel message
+        that decrypts to "<our name>: ...". Hearing a repeater relay the bot's
+        own reply would otherwise verify a region nobody else uses."""
+        me = self.node.get("pubkey")
+        if adv is not None:
+            return bool(me) and adv.get("pubkey", b"").hex() == me
+        name = str(self.node.get("name") or "")
+        payload = hdr.get("payload") or b""
+        if not name or hdr.get("payload_type") != PAYLOAD_TYPE_GRP_TXT or not payload:
+            return False
+        for idx, hb in list(self.correlator.channel_hashes.items()):
+            if hb != payload[0]:
+                continue
+            secret = self._secret_for(idx)
+            plain = group_text_plain(secret, payload) if secret else None
+            if plain is not None:
+                return plain[1].startswith(name + ": ")
+        return False
 
     async def _on_message(self, msg: Message) -> None:
         self.counters["rx_messages"] += 1

@@ -2,6 +2,7 @@
 when a count is enough to call a region verified."""
 
 import random
+import sqlite3
 
 import pytest
 
@@ -217,3 +218,25 @@ def test_summary_survives_a_failed_flush():
     w.observe(hdr(region="#tx-fw"), ts=NOW)
     assert w.summary(now=NOW)["heard"] == []          # nothing stored yet, no exception
     assert w._pending                                  # kept for the next try
+
+
+def test_a_failed_commit_does_not_leave_a_transaction_open():
+    s = Store(":memory:")
+    real = s._db
+
+    class FailCommit:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def execute(self, sql, *a):
+            if sql == "COMMIT":
+                raise sqlite3.OperationalError("database is locked")
+            return real.execute(sql, *a)
+
+    s._db = FailCommit()
+    with pytest.raises(sqlite3.OperationalError):
+        s.add_region_counts([(1, "#a", 1, 1.0)])
+    s._db = real
+    assert not real.in_transaction
+    s.count_region("#b", ts=NOW)                       # later writes still commit
+    assert "#b" in s.region_counts(since=0)
