@@ -235,9 +235,38 @@ OpenBot 1.3.0: MeshCore command bot for openHop Repeater. Up 3d04h. !help for co
 It names your help command's trigger, or leaves that part out when no
 enabled command uses `{help}`.
 
-New installs have the `!about` command. If your saved commands came from an
-older version, open the Commands tab and click **Add the !about command**,
-then save.
+## `!region`
+
+`!region` tells you how your message arrived, as the bot heard it:
+
+```
+@[bob] heard with region #tx-dfw: only repeaters that carry it pass it on
+@[bob] heard with no region: every repeater passes it on, across the whole mesh. Set a region in your app to keep it local
+```
+
+Other answers: a region the bot doesn't know (it lists the ones in your
+`regions` when they fit), a direct route (no region applies), or couldn't
+tell, when the message could not be matched to the packet the radio heard.
+On a channel with [replies to unscoped senders](#replies-to-unscoped-senders),
+someone who asks `!region` gets this answer instead of an unprompted reply.
+
+## `!me`
+
+`!me` says what the bot knows about you:
+
+```
+@[bob] this msg 2 hops, SNR 6.5, first advert 12d ago, last 3h ago, 14.2mi from here, 23 msgs in 24h
+```
+
+The adverts and position come from your node's adverts, so they are missing
+until the bot has heard one. Distance needs the bot's position
+(`node.latitude`/`longitude`) and yours. On a channel the bot finds you by
+exact name, and says so when several nodes use it (the details are then the
+newest one's); by DM it finds you by your key.
+
+New installs have `!about`, `!region` and `!me`. If your saved commands came
+from an older version, the Commands tab shows an **Add** button for whichever
+are missing; click it, then save.
 
 ## Usage
 

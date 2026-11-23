@@ -285,7 +285,8 @@ class Engine:
                 sender=req.sender, channel=req.channel, region=req.region,
                 hops_n=req.hops_n, hops=req.hops, hash_size=req.hash_size,
                 snr=req.snr, rssi=req.rssi, rx_ts=req.ts, packet_hash=req.packet_hash,
-                sent_ts=req.ts, heard_at=req.heard_at,
+                sent_ts=req.ts, heard_at=req.heard_at, scope=req.scope,
+                sender_prefix=req.sender_prefix if req.is_dm else b"",
             )
         ctx.update(extra)
         return ctx

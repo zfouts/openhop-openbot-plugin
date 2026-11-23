@@ -415,6 +415,85 @@ def fn_uptime(ctx, arg):
     return "up " + fmt_span(time.time() - (ctx.get("started_at") or time.time()))
 
 
+def _fit_parts(head: str, parts: List[str]) -> str:
+    """``head`` and as many of ``parts`` (most important first) as fit one frame."""
+    while parts:
+        out = head + ", ".join(parts)
+        if fits(out):
+            return out
+        parts = parts[:-1]
+    return clamp_bytes(head.rstrip(", "))
+
+
+def fn_region_check(ctx, arg):
+    """How the request was scoped, as the radio heard it: a configured region,
+    a region this node does not know, no region (a plain flood), a direct
+    route, or not known because the packet was not matched."""
+    head = "@[%s] " % (ctx.get("sender") or "?")
+    scope = ctx.get("scope") or "?"
+    if scope == "direct":
+        return head + "heard on a direct route: no region applies"
+    if scope == "*":
+        for body in ("heard with no region: every repeater passes it on, across the whole "
+                     "mesh. Set a region in your app to keep it local",
+                     "heard with no region: it floods the whole mesh. Set a region to keep "
+                     "it local", "heard with no region"):
+            if fits(head + body):
+                return head + body
+    if scope == "?":
+        return clamp_bytes(head + "couldn't tell: your message wasn't matched to the "
+                           "packet the radio heard")
+    if scope == "other":
+        known = [str(r) for r in (ctx.get("cfg") or {}).get("regions") or []]
+        body = "heard with a region this bot doesn't know"
+        if known and fits(head + body + " (it knows %s)" % ", ".join(known)):
+            body += " (it knows %s)" % ", ".join(known)
+        return clamp_bytes(head + body)
+    return clamp_bytes(head + "heard with region %s: only repeaters that carry it pass it "
+                       "on" % scope)
+
+
+def fn_me(ctx, arg):
+    """What this node knows about the sender: how this message arrived, their
+    adverts (first and last heard), where they are relative to this node, and
+    how many messages it heard from them in 24 h. A DM sender is looked up by
+    key, a channel sender by exact name; several nodes with that name are
+    flagged, since the details are then the newest one's."""
+    sender = ctx.get("sender") or "?"
+    store = ctx["store"]
+    head = "@[%s] " % sender
+    parts: List[str] = []
+    hops, snr = ctx.get("hops_n"), ctx.get("snr")
+    if hops is not None:
+        route = "direct" if hops == 0 else "%d hop%s" % (hops, "" if hops == 1 else "s")
+        parts.append("this msg %s%s" % (route, "" if snr is None else ", SNR %s" % snr))
+    prefix = ctx.get("sender_prefix") or b""
+    rows = store.nodes_with_key(bytes(prefix).hex()) if prefix else store.nodes_named(sender)
+    if rows:
+        row = rows[0]
+        keys = {r["pubkey"] for r in rows}
+        if not prefix and len(keys) > 1:
+            parts.append("%d nodes use this name" % len(keys))
+        if (row.get("adverts") or 0) > 1 and row["first_heard"] != row["last_heard"]:
+            parts.append("first advert %s, last %s" % (rel_age(row["first_heard"]),
+                                                       rel_age(row["last_heard"])))
+        else:
+            parts.append("advert heard %s" % rel_age(row["last_heard"]))
+        here = ctx.get("self_pos")
+        if row.get("lat") is not None and row.get("lon") is not None:
+            if here:
+                km = pathresolve.haversine_km(here[0], here[1], row["lat"], row["lon"])
+                parts.append("%s from here" % fmt_dist(km, ctx.get("units", "imperial")))
+            else:
+                parts.append("position on file")
+        else:
+            parts.append("no position in your adverts")
+    else:
+        parts.append("no advert from you heard yet")
+    parts.append("%d msgs in 24h" % store.msg_count(sender, int(time.time()) - 86400))
+    return _fit_parts(head, parts)
+
+
 ABOUT_LINK = "github.com/zfouts/openhop-openbot-plugin"
 
 
@@ -495,6 +574,8 @@ BUILTINS = {
     "uptime": fn_uptime,
     "version": lambda ctx, a: "openbot " + __version__,
     "about": fn_about,
+    "region_check": fn_region_check,
+    "me": fn_me,
 }
 
 HELP = {
@@ -539,6 +620,9 @@ HELP = {
     "version": "Plugin version",
     "about": "What this bot is: OpenBot version, uptime, the help command and a link"
              " to the repository",
+    "region_check": "Whether the request carried a region, as the radio heard it (!region)",
+    "me": "What this bot knows about the sender: this message's hops and SNR, their"
+          " adverts, distance, and messages in 24h (!me)",
 }
 
 

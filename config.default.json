@@ -147,6 +147,28 @@
       "regions": [],
       "dm": null,
       "cooldown_s": 30
+    },
+    {
+      "id": "region",
+      "enabled": true,
+      "trigger": "!region",
+      "description": "Whether your message carried a region",
+      "reply": "{region_check}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
+    },
+    {
+      "id": "me",
+      "enabled": true,
+      "trigger": "!me",
+      "description": "What this bot knows about you",
+      "reply": "{me}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
     }
   ],
   "announcements": [],

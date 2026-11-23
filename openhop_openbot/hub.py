@@ -446,10 +446,13 @@ class Hub:
                               path=">".join(req.hops) or None, ts=req.ts)
         if req.hops:
             self.store.record_chain(req.hops)
+        cmd = self.engine.find_command(req.text)
         if not req.is_dm and not self._is_me(req.sender):
             self.store.count_traffic(req.channel, req.scope, req.heard_at)
-            await self._maybe_nudge(req)
-        if not self.engine.find_command(req.text):
+            # Someone asking !region gets that answer, not an unprompted one as well.
+            if not (cmd and "{region_check" in str(cmd.get("reply") or "")):
+                await self._maybe_nudge(req)
+        if not cmd:
             return
         self.counters["commands"] += 1
         self.log_activity("rx", channel=req.channel, region=req.region, sender=req.sender,
@@ -625,7 +628,8 @@ class Hub:
             return Request(sender=sender, text=msg.text.strip(), channel=DM, region=region,
                            hops_n=hops_n, hops=hops, hash_size=hash_size, snr=snr, rssi=rssi,
                            ts=msg.timestamp, sender_prefix=bytes(msg.sender_prefix[:6]),
-                           packet_hash=frame.hash if frame else None, heard_at=heard_at)
+                           packet_hash=frame.hash if frame else None, heard_at=heard_at,
+                           scope=frame_scope(frame.hdr if frame else None, self.region_keys))
         sender, body = split_sender(msg.text)
         if not sender:
             return None
@@ -871,6 +875,7 @@ class Hub:
             hops_n=int(hops_n) if hops_n is not None else len(hops),
             hops=hops, hash_size=hash_size, snr=args.get("snr"),
         )
+        req.scope = req.region
         res = self.engine.handle(req, dry_run=True)
         out = {"matched": res.matched, "reply": res.reply, "extra": res.extra,
                "reason": res.reason,

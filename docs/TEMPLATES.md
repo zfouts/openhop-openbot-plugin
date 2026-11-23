@@ -62,6 +62,8 @@ It prints the result and its byte count. Roster built-ins see an empty roster.
 | `{help}` | Triggers of enabled commands (commands using `{mpath}` only when CoreScope is on) | `cmds: !path !ping !seen` |
 | `{uptime}` | Bot uptime | `up 3d04h` |
 | `{version}` | Plugin version | `openbot 1.0.0` |
+| `{region_check}` | How the request was scoped, as the radio heard it: a configured region, a region this node doesn't know (with the ones it does, when they fit), no region, a direct route, or couldn't tell (the packet was not matched) | `@[bob] heard with no region: every repeater passes it on, across the whole mesh. Set a region in your app to keep it local` |
+| `{me}` | What this node knows about the sender: this message's hops and SNR, their adverts, distance from this node (or whether a position is on file), and messages heard from them in 24 h. A DM sender is found by key, a channel sender by exact name (several nodes with the name are flagged). Detail is dropped from the end to fit | `@[bob] this msg 2 hops, SNR 6.5, first advert 12d ago, last 3h ago, 14.2mi from here, 23 msgs in 24h` |
 | `{about}` | What the bot is: OpenBot and its version, uptime, the trigger of the enabled `{help}` command (left out when there is none) and the repository. Uptime, then the help pointer, then the link are dropped if it would not fit one message | `OpenBot 1.3.0: MeshCore command bot for openHop Repeater. Up 3d04h. !help for commands. github.com/zfouts/openhop-openbot-plugin` |
 
 ## Worked examples

@@ -229,6 +229,24 @@ class Store:
         )
         return _row(rows[0]) if rows else None
 
+    def nodes_named(self, name: str) -> List[Dict[str, Any]]:
+        """Every node with exactly this name (ignoring case), newest first."""
+        rows = self._q("SELECT * FROM nodes WHERE name = ? COLLATE NOCASE "
+                       "ORDER BY last_heard DESC LIMIT 10", (name.strip(),))
+        return [_row(r) for r in rows]
+
+    def nodes_with_key(self, prefix: str) -> List[Dict[str, Any]]:
+        """Every node whose public key starts with ``prefix`` (hex), newest first."""
+        prefix = prefix.lower()
+        rows = self._q("SELECT * FROM nodes WHERE substr(pubkey, 1, ?) = ? "
+                       "ORDER BY last_heard DESC LIMIT 10", (len(prefix), prefix))
+        return [_row(r) for r in rows]
+
+    def msg_count(self, sender: str, since: int) -> int:
+        (n,) = self._q("SELECT count(*) FROM msgs WHERE sender = ? COLLATE NOCASE AND ts >= ?",
+                       (sender.strip(), since))[0]
+        return int(n)
+
     def position_of(self, name: str) -> Optional[tuple[float, float]]:
         """A node's position by exact name, only when exactly one pubkey has it.
 
