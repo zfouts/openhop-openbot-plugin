@@ -262,6 +262,10 @@ The **Usage** tab shows it:
 - Hourly bars for windows up to 48 h, daily bars beyond.
 - Breakdowns by command (answered and skipped), the top 10 requesters,
   channels, regions, and skip reasons.
+- **What the bot sent**: every message the bot transmitted (replies,
+  follow-ups, unscoped replies, announcements, manual sends and adverts),
+  with its estimated time on air, the share of the time that is, the busiest
+  hour, and what was not sent. See [Airtime limits](#airtime-limits).
 - **Channel traffic by region**: every channel message the radio heard, not
   only commands, by whether it carried a region. See
   [Unscoped traffic](#unscoped-traffic).
@@ -289,6 +293,14 @@ connected to the companion.
 | `limits.tx_max_per_min` | 8 | Cap per minute. The rest wait. |
 
 Per-sender limits are in [their own section](#per-sender-limits).
+
+The Usage tab's **What the bot sent** shows how much airtime the bot actually
+uses, so you can tell whether these are set right. Airtime is estimated from
+each message's size and the radio settings the companion reports (shown on
+the Status tab), plus `node.preamble_symbols` (Advanced tab, default 16),
+which the companion does not report and which only affects the estimate. It
+counts the bot's own transmission: every repeater that forwards a flood sends
+it again.
 
 Everything the bot sends (replies, unscoped replies, announcements, manual
 sends) goes through one queue. It holds at most 12 messages; beyond that they are dropped. Extra

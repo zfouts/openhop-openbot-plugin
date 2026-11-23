@@ -31,6 +31,7 @@ class TxJob:
     dm_prefix: Optional[bytes] = None      # or direct message
     scope: Optional[bytes] = None          # flood region (see CompanionClient)
     label: str = ""
+    kind: str = "send"                     # reply, follow-up, nudge, announce, send
     not_before: float = 0.0                # monotonic
     queued_at: float = field(default_factory=time.monotonic)
 

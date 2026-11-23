@@ -231,3 +231,65 @@ def summarize_traffic(rows: Sequence[Mapping[str, Any]], nudges: Sequence[Mappin
         "channels": out_channels,
         "regions": _ranked(regions),
     }
+
+
+TX_KINDS = ("reply", "follow-up", "nudge", "announce", "send", "advert")
+
+
+def summarize_airtime(rows: Sequence[Mapping[str, Any]], window: Mapping[str, Any],
+                      tz: str) -> Dict[str, Any]:
+    """What the bot transmitted, over the same buckets as ``summarize``.
+
+    ``rows`` are the store's tx_log rows. Airtime is the estimate made when
+    each message went out (None when the radio settings were not known);
+    ``share_pct`` is that airtime over the whole window, and ``busiest_hour``
+    the clock hour with the most.
+    """
+    zone = _zone(tz)
+    bucket = window["bucket"]
+    starts = _bucket_starts(window["from"], window["to"], bucket, zone)
+    series: List[Dict[str, int]] = [{} for _ in starts]
+    kinds: Dict[str, Dict[str, Any]] = {}
+    hours: Counter = Counter()
+    totals = {"sent": 0, "failed": 0, "dropped": 0, "bytes": 0, "airtime_ms": 0.0,
+              "unestimated": 0}
+    for r in rows:
+        k = kinds.setdefault(r["kind"], {"kind": r["kind"], "sent": 0, "failed": 0,
+                                         "dropped": 0, "bytes": 0, "airtime_ms": 0.0})
+        outcome = r["outcome"] if r["outcome"] in ("sent", "failed", "dropped") else "failed"
+        k[outcome] += 1
+        totals[outcome] += 1
+        if outcome != "sent":
+            continue
+        k["bytes"] += int(r["bytes"] or 0)
+        totals["bytes"] += int(r["bytes"] or 0)
+        if r.get("airtime_ms") is None:
+            totals["unestimated"] += 1
+        else:
+            k["airtime_ms"] += float(r["airtime_ms"])
+            totals["airtime_ms"] += float(r["airtime_ms"])
+            hours[int(r["ts"] // 3600)] += float(r["airtime_ms"])
+        i = bisect_right(starts, r["ts"]) - 1
+        if 0 <= i < len(starts):
+            series[i][r["kind"]] = series[i].get(r["kind"], 0) + 1
+    span = max(1.0, float(window["to"]) - float(window["from"]))
+    busiest = None
+    if hours:
+        hour, ms = max(hours.items(), key=lambda kv: (kv[1], -kv[0]))
+        dt = datetime.fromtimestamp(hour * 3600, zone)
+        busiest = {"t": hour * 3600.0, "label": "%s %d %02d:00" % (
+            _MONTHS[dt.month - 1], dt.day, dt.hour), "airtime_ms": round(ms, 1),
+            "share_pct": round(ms / 36000.0, 3)}
+    order = {k: i for i, k in enumerate(TX_KINDS)}
+    out_kinds = sorted(kinds.values(), key=lambda k: (order.get(k["kind"], 99), k["kind"]))
+    for k in out_kinds:
+        k["airtime_ms"] = round(k["airtime_ms"], 1)
+    return {
+        "bucket": bucket,
+        "totals": {**totals, "airtime_ms": round(totals["airtime_ms"], 1),
+                   "share_pct": round(totals["airtime_ms"] / (span * 10.0), 3)},
+        "busiest_hour": busiest,
+        "kinds": out_kinds,
+        "series": [{"t": t, "label": _label(t, bucket, zone), "counts": c}
+                   for t, c in zip(starts, series)],
+    }

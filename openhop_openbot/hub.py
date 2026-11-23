@@ -34,7 +34,14 @@ from .engine.pathresolve import split_chain
 from .engine.schedule import Schedule
 from .engine.templates import clamp_bytes, render
 from .engine.moderation import sender_key
-from .engine.usage import parse_window, skip_category, summarize, summarize_traffic
+from .engine.usage import (
+    parse_window,
+    skip_category,
+    summarize,
+    summarize_airtime,
+    summarize_traffic,
+)
+from .mesh import airtime
 from .mesh.companion import Advert, CompanionClient, Message
 from .mesh.correlate import FrameCorrelator, region_of
 from .mesh.frames import (
@@ -299,6 +306,9 @@ class Hub:
         if si is not None:
             self.node["name"] = si.name
             self.node["pubkey"] = si.public_key.hex()
+            radio = {"freq_khz": si.radio_freq_khz, "bw_hz": si.radio_bw_hz,
+                     "sf": si.radio_sf, "cr": si.radio_cr}
+            self.node["radio"] = radio if airtime.radio_known(radio) else None
         lat, lon = node.get("latitude"), node.get("longitude")
         if lat is None and si is not None and (si.latitude or si.longitude):
             lat, lon = si.latitude, si.longitude
@@ -475,7 +485,8 @@ class Hub:
         for follow_up in result.later:
             self._schedule_follow_up(req, result.matched, follow_up)
 
-    def _reply_job(self, req: Request, cid: str, text: str, delay_s: float = 0.0) -> TxJob:
+    def _reply_job(self, req: Request, cid: str, text: str, delay_s: float = 0.0,
+                   kind: str = "reply") -> TxJob:
         """A frame answering ``req``: back where it came from, in its region."""
         return TxJob(
             text=text,
@@ -483,6 +494,7 @@ class Hub:
             dm_prefix=req.sender_prefix if req.is_dm else None,
             scope=None if req.is_dm else self.engine.reply_scope(req.region),
             label="%s:%s" % (cid, req.region),
+            kind=kind,
             not_before=time.monotonic() + delay_s,
         )
 
@@ -508,7 +520,7 @@ class Hub:
         if not text:
             return
         text = clamp_bytes(str(text))
-        self.tx.put(self._reply_job(req, cid, text))
+        self.tx.put(self._reply_job(req, cid, text, kind="follow-up"))
         self.log_activity("reply", channel=req.channel, region=req.region, sender=req.sender,
                           text=text, detail="%s (follow-up)" % cid)
 
@@ -582,7 +594,7 @@ class Hub:
         text = clamp_bytes(text)
         if not self.tx.put(TxJob(text=text, channel_idx=req.channel_idx,
                                  scope=self.scope_for(str(rule.get("region") or "")),
-                                 label="nudge:%s" % req.channel)):
+                                 label="nudge:%s" % req.channel, kind="nudge")):
             self.store.drop_nudge(row)      # not sent, so it does not count
             return
         self.log_activity("nudge", channel=req.channel, region=req.region,
@@ -641,6 +653,26 @@ class Hub:
     def _on_tx_result(self, job: TxJob, ok: bool, why: str) -> None:
         if not ok:
             self.log_activity("error", text=job.text, detail="tx %s: %s" % (job.label, why))
+        dm = job.dm_prefix is not None
+        nbytes = airtime.text_packet_bytes(job.text, node_name=str(self.node.get("name") or ""),
+                                           dm=dm, scoped=bool(job.scope))
+        channel = "dm" if dm else str((self.slots.get(job.channel_idx) or {}).get("name")
+                                      or job.channel_idx)
+        outcome = "sent" if ok else ("dropped" if why in ("queue full", "stale") else "failed")
+        self._record_tx(job.kind, channel, nbytes, outcome)
+
+    def _preamble(self) -> int:
+        return int((self.cfg.get("node") or {}).get("preamble_symbols")
+                   or airtime.DEFAULT_PREAMBLE)
+
+    def _record_tx(self, kind: str, channel: str, nbytes: int, outcome: str) -> None:
+        air = airtime.airtime_ms(nbytes, self.node.get("radio"), self._preamble()) \
+            if outcome == "sent" else None
+        try:
+            self.store.record_tx(kind=kind, channel=channel, nbytes=nbytes, airtime_ms=air,
+                                 outcome=outcome)
+        except Exception as exc:
+            logger.error("could not record a transmission: %s", exc)
 
     def resolve_channel(self, token: Any) -> Optional[int]:
         if isinstance(token, int) or (isinstance(token, str) and token.strip().isdigit()):
@@ -664,13 +696,14 @@ class Hub:
         except ValueError:
             return None
 
-    def send_text(self, channel: Any, text: str, region: str = "", label: str = "") -> bool:
+    def send_text(self, channel: Any, text: str, region: str = "", label: str = "",
+                  kind: str = "send") -> bool:
         idx = self.resolve_channel(channel)
         if idx is None:
             self.log_activity("error", text=text, detail="no channel %r" % channel)
             return False
         return self.tx.put(TxJob(text=text, channel_idx=idx, scope=self.scope_for(region),
-                                 label=label or "send"))
+                                 label=label or "send", kind=kind))
 
     # ------------------------------------------------------- announcements --
 
@@ -679,7 +712,7 @@ class Hub:
         if not text:
             return False
         ok = self.send_text(ann.get("channel"), text, ann.get("region") or "",
-                            label="announce:%s" % ann.get("id"))
+                            label="announce:%s" % ann.get("id"), kind="announce")
         if ok:
             self.log_activity("announce", channel=ann.get("channel"),
                               region=ann.get("region"), text=text, detail=ann.get("id"))
@@ -765,6 +798,8 @@ class Hub:
             nudges = await asyncio.to_thread(self.store.nudge_rows, window["from"],
                                              window["to"])
             out["traffic"] = summarize_traffic(traffic, nudges, window, tz)
+            sent = await asyncio.to_thread(self.store.tx_rows, window["from"], window["to"])
+            out["airtime"] = summarize_airtime(sent, window, tz)
             return out
         if action == "advert":
             flood = args.get("flood", True)
@@ -773,6 +808,9 @@ class Hub:
             if not self.client.is_connected():
                 raise RuntimeError("companion not connected")
             sent = bool(await self.client.send_self_advert(flood=flood))
+            self._record_tx("advert", "", airtime.advert_packet_bytes(
+                str(self.node.get("name") or ""), self.node.get("self_pos") is not None),
+                "sent" if sent else "failed")
             self.log_activity("tx", detail="advert to %s -> %s" % (
                 "the whole mesh" if flood else "neighbours", "ok" if sent else "refused"))
             return {"sent": sent, "flood": flood}
@@ -864,6 +902,8 @@ class Hub:
                 "pubkey": self.node.get("pubkey"),
                 "latitude": pos[0] if pos else None,
                 "longitude": pos[1] if pos else None,
+                "radio": {**self.node["radio"], "preamble": self._preamble()}
+                if self.node.get("radio") else None,
                 "config_problems": self.problems,
             },
             "counters": {**{k: self.counters.get(k, 0) for k in

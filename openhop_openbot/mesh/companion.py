@@ -123,6 +123,10 @@ class SelfInfo:
     name: str
     latitude: float
     longitude: float
+    radio_freq_khz: int = 0         # the radio the companion transmits on
+    radio_bw_hz: int = 0
+    radio_sf: int = 0
+    radio_cr: int = 0               # 5..8 (4/5..4/8), or the 1..4 index form
 
 
 def parse_self_info(frame: bytes) -> Optional[SelfInfo]:
@@ -130,8 +134,10 @@ def parse_self_info(frame: bytes) -> Optional[SelfInfo]:
         return None
     lat = struct.unpack("<i", frame[36:40])[0] / 1e6
     lon = struct.unpack("<i", frame[40:44])[0] / 1e6
+    freq, bw = struct.unpack("<II", frame[48:56])
     name = frame[58:].split(b"\x00")[0].decode("utf-8", errors="replace")
-    return SelfInfo(public_key=frame[4:36], name=name, latitude=lat, longitude=lon)
+    return SelfInfo(public_key=frame[4:36], name=name, latitude=lat, longitude=lon,
+                    radio_freq_khz=freq, radio_bw_hz=bw, radio_sf=frame[56], radio_cr=frame[57])
 
 
 @dataclass
