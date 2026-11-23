@@ -125,10 +125,12 @@ Other rules:
 - The trigger is matched at the start of the message, case-insensitively, on a
   word boundary. `!path` does not match `!pathx`. The longest matching trigger
   wins.
+- A command can have **aliases**: other triggers for it (`!p` for `!path`),
+  set on the Commands tab. They share its cooldown and usage, and `!help`
+  lists only the main trigger. A trigger always wins over an alias.
 - The bot ignores its own messages.
 - A reply that renders empty is not sent and does not use a cooldown.
-- `cooldown_s` is per command, requester, channel and region.
-  `limits.user_cooldown_s` is a floor across all commands for one requester.
+- Each sender is also held to the [per-sender limits](#per-sender-limits).
 
 ## Regions
 
@@ -243,8 +245,8 @@ The bot records every request that matches a command trigger in its SQLite
 database (`openbot.db`, table `usage`). Each row has:
 
 - the time it was heard and the command id;
-- whether it was answered or skipped, and for a skip the category: cooldown,
-  out of scope, empty reply, or other;
+- whether it was answered or skipped, and for a skip the category: banned,
+  cooldown, rate limit, out of scope, empty reply, or other;
 - the channel (or `dm`), the region, and the sender.
 
 Sender names are stored, and rows are kept for 366 days. The existing
@@ -260,6 +262,9 @@ The **Usage** tab shows it:
 - Hourly bars for windows up to 48 h, daily bars beyond.
 - Breakdowns by command (answered and skipped), the top 10 requesters,
   channels, regions, and skip reasons.
+- **Channel traffic by region**: every channel message the radio heard, not
+  only commands, by whether it carried a region. See
+  [Unscoped traffic](#unscoped-traffic).
 
 Each query goes through the `_cmd` mailbox, which saves the config, the same
 as the test box. If you have unsaved edits you are asked first. The bot must
@@ -282,12 +287,116 @@ connected to the companion.
 |---|---|---|
 | `limits.tx_gap_s` | 2.5 | Minimum seconds between transmissions. |
 | `limits.tx_max_per_min` | 8 | Cap per minute. The rest wait. |
-| `limits.user_cooldown_s` | 5 | Per-requester floor across commands. |
 
-Everything the bot sends (replies, announcements, manual sends) goes through one
-queue. It holds at most 12 messages; beyond that they are dropped. Extra
+Per-sender limits are in [their own section](#per-sender-limits).
+
+Everything the bot sends (replies, unscoped replies, announcements, manual
+sends) goes through one queue. It holds at most 12 messages; beyond that they are dropped. Extra
 messages from one reply are spaced 5 s apart. Text is clamped to 160 bytes, cut
 on a character boundary, never mid-character.
+
+## Per-sender limits
+
+On the **Moderation** tab. A request has to pass all three:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `limits.user_cooldown_s` | 5 | Seconds between one sender's commands, any command. |
+| `commands[].cooldown_s` | per command | Seconds before the same sender can use that command again. |
+| `limits.user_max_requests` per `limits.user_window_s` | 8 per 600 | Answered commands per sender in any 10 minutes. `0` turns it off. |
+
+A sender is their name, ignoring case. All three follow the sender everywhere:
+asking again on another channel, in another region or by DM does not start a
+new cooldown. A skip entry in the activity list says which one stopped a
+request.
+
+## Bans
+
+Also on the **Moderation** tab. A ban is a regular expression (Python
+syntax) searched anywhere in the sender's name:
+
+| Pattern | Bans |
+|---|---|
+| `^bob$` | `bob`, `Bob`, `BOB` (with **Ignore case**, the default) |
+| `^spam` | any name starting with `spam` |
+| `bot\d+$` | names ending in `bot` and digits |
+
+The bot ignores a banned sender completely: no command replies and no
+unscoped replies. Their requests show as `banned` skips, and their messages
+still count in the roster and traffic, since that is what the radio heard.
+
+Things to know:
+
+- On a channel the sender is only a name, whatever precedes `: ` in the
+  message. Anyone can pick any name, so a ban stops a name, not a radio.
+- On a DM the name is the contact's name, or the first 8 hex digits of its
+  public key when the companion does not know the contact.
+- Names are cut to 64 characters before matching, longer than any real node
+  name. Avoid nested repeats such as `(a+)+`: a pattern like that can take a
+  long time on a crafted name.
+- A pattern that does not compile is skipped and listed under configuration
+  problems on the Status tab.
+
+**Test a name** asks the running bot whether a name is banned and by which
+rule. It uses the saved bans, so save first.
+
+### Automatic bans
+
+With **Ban a sender who keeps hitting the limits** on (`auto_ban.enabled`,
+off by default), each request refused by a per-sender limit is a strike.
+`auto_ban.strikes` strikes (default 5) within `auto_ban.window_s` seconds
+(default 600) ban that sender for `auto_ban.ban_h` hours (default 24).
+
+The bot sends nothing when it bans someone. The ban shows on the Moderation
+tab, with a **Lift** button, and as a `ban` entry in the activity list. It
+ends on its own. Automatic bans are kept in `openbot.db`, so they survive
+restarts.
+
+## Unscoped traffic
+
+MeshCore messages can carry a region. A message with none is a plain flood:
+every repeater that hears it forwards it, across the whole mesh. The bot
+counts every channel message the radio hears by how it was scoped:
+
+| Class | Meaning |
+|---|---|
+| no region | A plain flood. |
+| in a region | Scoped to one of your `regions`, or to a region you have not listed. |
+| could not tell | The packet could not be matched to the message. |
+| direct | Arrived on a direct route. |
+
+The **Usage** tab shows the totals, a chart, each channel's share of messages
+with no region, and which regions scoped messages used. "Could not tell" is
+left out of the share. Counts are hourly, kept 366 days, and never leave the
+node.
+
+### Replies to unscoped senders
+
+Off by default. On the **Scope & Regions** tab, add a channel under
+**Replies to unscoped senders** to have the bot reply to people who post
+there with no region:
+
+```
+@[bob] your message had no region, so it flooded the whole mesh. Set a region in your app to keep it local.
+```
+
+| Setting | Default | Effect |
+|---|---|---|
+| `channel` | | The channel. One entry per channel. |
+| `per_sender` | 1 | Replies to one sender... |
+| `per_channel` | 6 | ...and in total on the channel... |
+| `window_h` | 24 | ...in any this many hours. |
+| `region` | empty | Where the reply is sent: empty for the companion default, `*` unscoped, or `#name`. Sending in a region keeps the reply itself from flooding the mesh. |
+| `text` | as above | A template: `{sender}`, `{channel}` and the other tokens work. Keep `@[{sender}]` so they see it. |
+
+The bot only replies when it can prove the message had no region: the packet
+it heard was a plain flood **and** decrypts, with the channel's key, to
+exactly that message. A message it cannot match is never answered. Banned
+senders, the bot itself, requests beyond `scope.max_hops` and protected
+channels (Public, by default) never get a reply.
+
+The test box on the Commands tab shows the reply when you test with region
+`*` on that channel. Each reply sent is a `nudge` entry in the activity list.
 
 ## Announcements
 
@@ -446,7 +555,10 @@ openHop keeps the field through later installs and updates, uploaded or not.
 | Updates card says **Check failed** | The repeater could not reach GitHub, or hit GitHub's limit of 60 unauthenticated API calls an hour (shared with openHop's own plugin checks). Wait and click **Check again**. |
 | Update failed | The notice shows openHop's error. A failed download changes nothing. A failed install happens after openHop has stopped the bot, so check the plugin's state on the Plugins page and start it if needed; its log has the details. |
 | State `FAILED` or log shows `Companion connection lost ... retry` | Companion not listening. Check step 3, the port, and that nothing else (another plugin, a phone app) holds the companion. |
-| Bot never answers | Look at the activity list in the plugin page. A `skip` entry names the reason: `channel ... not in scope`, `region ... not in scope`, `protected channel`, `requester cooldown`, `command cooldown`. |
+| Bot never answers | Look at the activity list in the plugin page. A `skip` entry names the reason: `channel ... not in scope`, `region ... not in scope`, `protected channel`, `banned (...)`, `requester cooldown`, `command cooldown`, `requester rate limit`. |
+| Someone is ignored and you don't know why | Moderation tab: **Test a name**. A rule or an automatic ban is named; lift an automatic ban there. |
+| No unscoped replies | The channel needs an enabled entry under **Replies to unscoped senders**, and the sender must have sent a plain flood the bot could verify. Check the caps: one per sender per 24 h by default. |
+| Usage shows a lot of "could not tell" | The radio delivered messages it could not match to a heard packet, such as ones queued while the bot was disconnected. |
 | Silent when you list regions | The request was `?` or unscoped. Add the region to the top-level `regions`, and add `*` to allow unscoped. |
 | Silent on Public | By design. |
 | `!path` has no link | CoreScope is off, the frame could not be matched to the message (no packet hash), or the shortener failed and the full link did not fit. Check the log for `link shortening failed`. |

@@ -19,14 +19,15 @@ const DEFAULTS = {
   node: { name: '', latitude: null, longitude: null, timezone: 'America/Chicago', units: 'imperial', path_hash_bytes: 2 },
   channels: [], regions: [],
   scope: { channels: [], regions: [], allow_dm: true, protected_channels: ['Public'], max_hops: null },
-  limits: { tx_gap_s: 2.5, tx_max_per_min: 8, user_cooldown_s: 5, reply_in_request_region: true },
+  limits: { tx_gap_s: 2.5, tx_max_per_min: 8, user_cooldown_s: 5, user_max_requests: 8, user_window_s: 600, reply_in_request_region: true },
+  bans: [], auto_ban: { enabled: false, strikes: 5, window_s: 600, ban_h: 24 }, nudges: [],
   commands: [], announcements: [],
   weather: { units: 'auto', default_country: 'us', contact: '' },
   corescope: { enabled: false, base_url: '', shortener: 'v.gd', shortener_url: '', shortener_key: '', mpath_wait_s: 30 },
 };
 
 const TABS = [
-  ['status', 'Status'], ['commands', 'Commands'], ['scope', 'Scope & Regions'], ['announce', 'Announcements'],
+  ['status', 'Status'], ['commands', 'Commands'], ['scope', 'Scope & Regions'], ['moderation', 'Moderation'], ['announce', 'Announcements'],
   ['weather', 'Weather'], ['send', 'Send'], ['activity', 'Activity'], ['usage', 'Usage'], ['nodes', 'Nodes'],
   ['corescope', 'CoreScope'], ['advanced', 'Advanced'],
 ];
@@ -216,6 +217,12 @@ function validate() {
     trigs.add(t);
     if (typeof m.cooldown_s !== 'number' || !isFinite(m.cooldown_s) || m.cooldown_s < 0) e.push(n + ': cooldown must be a number of 0 or more');
   });
+  c.commands.forEach((m, i) => (Array.isArray(m.aliases) ? m.aliases : []).forEach((a) => {
+    const t = String(a || '').trim().toLowerCase();
+    if (!t) return;
+    if (trigs.has(t)) e.push('Command ' + (i + 1) + (m.id ? ' (' + m.id + ')' : '') + ': alias "' + a + '" is already a trigger or alias');
+    trigs.add(t);
+  }));
   const idx = new Set();
   c.channels.forEach((ch, i) => {
     const n = 'Channel slot ' + (ch.idx === '' ? '?' : ch.idx);
@@ -247,6 +254,22 @@ function validate() {
   num(c.companion.port, 'Companion port', 1, 65535);
   num(c.node.path_hash_bytes, 'path_hash_bytes', 1, 3);
   num(c.limits.tx_gap_s, 'tx_gap_s', 0); num(c.limits.tx_max_per_min, 'tx_max_per_min', 0); num(c.limits.user_cooldown_s, 'user_cooldown_s', 0);
+  num(c.limits.user_max_requests, 'Most answered commands per sender', 0, 1000); num(c.limits.user_window_s, 'Per-sender window', 10, 86400);
+  c.bans.forEach((b, i) => { if (!String(b.pattern || '')) e.push('Ban ' + (i + 1) + ': pattern is required (an empty one would match everyone)'); });
+  num(c.auto_ban.strikes, 'Refusals before an automatic ban', 1, 1000); num(c.auto_ban.window_s, 'Automatic ban window', 10, 86400); num(c.auto_ban.ban_h, 'Automatic ban length', 0.1, 8760);
+  const prot = new Set(c.scope.protected_channels.map(chanNorm)), nch = new Set();
+  c.nudges.forEach((x, i) => {
+    const n = 'Unscoped reply ' + (i + 1) + (x.channel ? ' (' + x.channel + ')' : '');
+    const k = chanNorm(x.channel);
+    if (!k) e.push(n + ': channel is required');
+    else if (prot.has(k)) e.push(n + ': ' + x.channel + ' is protected; the bot never sends there');
+    else if (nch.has(k)) e.push(n + ': a channel can have only one');
+    nch.add(k);
+    if (!String(x.text || '').trim()) e.push(n + ': text is required');
+    const r = String(x.region || '').trim();
+    if (r && r !== '*' && !r.startsWith('#')) e.push(n + ': region must be empty, * or a #name');
+    num(x.per_sender, n + ': per sender', 1, 100); num(x.per_channel, n + ': per channel', 1, 1000); num(x.window_h, n + ': hours', 0.1, 720);
+  });
   if ((c.corescope.enabled || c.corescope.base_url) && !/^https?:\/\/[^\/\s]+/.test(c.corescope.base_url || '')) e.push('CoreScope base URL must start with http:// or https://');
   if (c.corescope.shortener === 'custom' && !/^https:\/\/[^\/\s?#]+[^\s?#]*$/.test(c.corescope.shortener_url || '')) e.push('Custom shortener URL must be an https:// address');
   num(c.corescope.mpath_wait_s, '!mpath wait', 5, 300);
@@ -376,6 +399,7 @@ function chips(arr, o = {}) {
 }
 
 const channelNames = () => [...(cfg.channels || []).map((c) => c.name).filter(Boolean)];
+const chanNorm = (n) => String(n || '').trim().replace(/^#/, '').trim().toLowerCase();
 const regionNames = () => [...(cfg.regions || [])];
 
 // ---------------------------------------------------------------- actions (mailbox)
@@ -655,7 +679,15 @@ function inheritChannels() {
 }
 const inheritRegions = () => (cfg.scope.regions.length ? cfg.scope.regions.join(', ') : 'any region');
 
+const NUDGE_TEXT = '@[{sender}] your message had no region, so it flooded the whole mesh. Set a region in your app to keep it local.';
 const ABOUT_CMD = { id: 'about', enabled: true, trigger: '!about', description: 'What this bot is and the version it runs', reply: '{about}', channels: [], regions: [], dm: null, cooldown_s: 30 };
+function aliasField(m) {
+  // Only write m.aliases once the operator adds one, so opening a card is not an edit.
+  const al = Array.isArray(m.aliases) ? m.aliases : [];
+  return h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Aliases' }),
+    chips(al, { aria: 'Add alias for ' + (m.id || 'command'), ph: '!p', onchange: () => { m.aliases = al; } }),
+    h('small', { text: 'Other triggers for this command. They share its cooldown and usage; {help} lists only the trigger.' }));
+}
 function tabCommands() {
   const list = h('div');
   const fires = new Map();
@@ -704,9 +736,10 @@ function tabCommands() {
       h('div', { class: 'grid' },
         field('Trigger', textIn(m, 'trigger', { mono: true, ph: '!name', onchange: upd })),
         field('ID', textIn(m, 'id', { mono: true, onchange: upd }), 'Unique; used for stats and announce/test.'),
-        field('Cooldown (seconds)', numIn(m, 'cooldown_s', { min: 0 }), 'Per requester, per channel and region.'),
+        field('Cooldown (seconds)', numIn(m, 'cooldown_s', { min: 0 }), 'Per requester, on every channel and region.'),
         h('div', {}, check('Enabled', m, 'enabled', { onchange: upd }))),
       field('Description', textIn(m, 'description', { onchange: upd }), 'Shown by {help}.'),
+      aliasField(m),
       h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Reply template' }), ta,
         h('small', {}, cnt, ' \u00b7 Counts the template text; the rendered reply is capped at ' + MAX_BYTES + ' bytes on air.')),
       h('div', { class: 'grid' },
@@ -772,7 +805,8 @@ function tabCommands() {
       tres.replaceChildren(h('div', { class: 'result' },
         h('p', {}, h('b', { text: res.matched ? 'Matched: ' + res.matched : 'No command matched' }), res.reason ? ' (' + res.reason + ')' : ''),
         res.reply ? h('p', { class: 'mono', text: res.reply }) : null,
-        res.reply ? h('span', { class: 'counter-bytes', text: bytes(res.reply) + ' bytes' }) : null));
+        res.reply ? h('span', { class: 'counter-bytes', text: bytes(res.reply) + ' bytes' }) : null,
+        res.nudge ? h('p', {}, h('b', { text: 'Unscoped reply: ' }), h('span', { class: 'mono', text: res.nudge }), h('span', { class: 'muted', text: '  (sent only when the message is heard as a plain, unscoped flood)' })) : null));
     } else tres.replaceChildren(resultNode(r));
   } });
   const tin = (k, lbl, o = {}) => { const el = h('input', { class: o.mono ? 'mono' : '', placeholder: o.ph, autocomplete: 'off' }); el.value = T[k]; el.addEventListener('input', () => { T[k] = el.value; }); return field(lbl, el, o.hint); };
@@ -818,6 +852,31 @@ function tabScope() {
   } });
   const pres = h('div', { 'aria-live': 'polite' });
   const regIn = chips(cfg.regions, { aria: 'Add region', ph: '#tx-dfw', onchange: () => {} });
+  const nudgeList = h('div');
+  const openChannels = () => channelNames().filter((n) => !cfg.scope.protected_channels.map(chanNorm).includes(chanNorm(n)));
+  const renderNudges = () => {
+    nudgeList.replaceChildren(...(cfg.nudges.length ? cfg.nudges.map((n, i) => {
+      const [cnt, upd] = byteCounter(() => n.text);
+      return h('div', { class: 'card stack' },
+        h('div', { class: 'grid' },
+          h('div', {}, check('Enabled', n, 'enabled')),
+          field('Channel', textIn(n, 'channel', { mono: true, list: 'dl-nch', ph: '#bot' })),
+          field('Send in region', textIn(n, 'region', { mono: true, list: 'dl-nrg', ph: 'companion default' }), 'Empty = companion default, * = unscoped. A region keeps the reply itself from flooding the mesh.'),
+          field('At most, per sender', numIn(n, 'per_sender', { min: 1, max: 100, step: 1 })),
+          field('At most, for the channel', numIn(n, 'per_channel', { min: 1, max: 1000, step: 1 })),
+          field('In any (hours)', numIn(n, 'window_h', { min: 0.1, max: 720 }))),
+        h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Reply' }), textarea(n, 'text', { rows: 2, aria: 'Reply for ' + (n.channel || 'channel'), onchange: upd }),
+          h('small', {}, cnt, ' {sender} and the other template tokens work here. Include @[{sender}] so they see it.')),
+        h('div', { class: 'row' }, h('button', { type: 'button', class: 'sm danger', text: 'Remove', onclick: () => { cfg.nudges.splice(i, 1); changed(); renderNudges(); } })));
+    }) : [h('p', { class: 'muted', text: 'Off on every channel.' })]));
+  };
+  renderNudges();
+  const addNudge = h('button', { type: 'button', text: 'Add a channel', onclick: () => {
+    const used = new Set(cfg.nudges.map((x) => chanNorm(x.channel)));
+    const ch = openChannels().find((x) => !used.has(chanNorm(x))) || '';
+    cfg.nudges.push({ channel: ch, enabled: true, region: '', per_sender: 1, per_channel: 6, window_h: 24, text: NUDGE_TEXT });
+    changed(); renderNudges();
+  } });
   return { el: h('div', {},
     h('div', { class: 'card' }, h('h2', { text: 'What region scoping does' }),
       h('p', { text: 'MeshCore regions are transport-code scopes. A region-scoped flood packet carries a 16-bit code derived from the region name, so repeaters can filter traffic by region. The bot checks each request against every region listed below to learn which one it arrived under.' }),
@@ -833,10 +892,96 @@ function tabScope() {
         field('Max hops', numIn(s, 'max_hops', { nullable: true, min: 0, step: 1, ph: 'no limit' }), 'Ignore requests that travelled further than this. Empty = no limit.')),
       check('Answer direct messages by default', s, 'allow_dm', { onchange: () => {} }),
       check('Reply in the region the request arrived under', cfg.limits, 'reply_in_request_region')),
+    h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Replies to unscoped senders' }), addNudge),
+      h('p', { text: 'Off unless you turn it on for a channel. When the radio hears someone on that channel send a message with no region (a plain flood, which every repeater forwards across the whole mesh), the bot replies to suggest they set one.' }),
+      h('p', { class: 'hint', text: 'The bot only replies when it can prove the message had no region: the packet it heard was a plain flood and decrypts to exactly that message. Messages it cannot match are never answered. Banned senders and protected channels never get one. The Usage tab shows how much of each channel\'s traffic is unscoped.' }),
+      nudgeList, datalist('dl-nch', openChannels()), datalist('dl-nrg', ['*', ...regionNames()])),
     h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Channel slots' }),
       h('button', { type: 'button', text: 'Add channel', onclick: () => { let n = 1; const used = new Set(cfg.channels.map((c) => c.idx)); while (used.has(n) && n < 40) n++; cfg.channels.push({ idx: n, name: '#' }); changed(); renderCh(); } }), prov),
       h('p', { class: 'hint', text: 'Slot 1 to 39 on the companion radio. Hashtag channels (#name) derive their key from the name; anything else needs a 32-hex secret. Save, then provision to write them to the radio.' }),
       chRows, pres)) };
+}
+
+// ---------------------------------------------------------------- tab: moderation
+// A checkbox for a flag that is on when the key is missing (as the bot reads it).
+function flagOn(obj, key, label) {
+  const el = h('input', { type: 'checkbox', checked: obj[key] !== false, 'aria-label': label });
+  el.addEventListener('change', () => { obj[key] = el.checked; changed(); });
+  return el;
+}
+function tabModeration() {
+  const ab = cfg.auto_ban, lim = cfg.limits;
+  const list = h('div');
+  const render = () => {
+    list.replaceChildren(cfg.bans.length ? h('div', { class: 'stack' }, cfg.bans.map((b, i) => h('div', { class: 'row ban-row' },
+      field('Pattern', textIn(b, 'pattern', { mono: true, ph: '^spammer$' }), null, 'ban-pat'),
+      field('Note', textIn(b, 'note', { ph: 'optional' }), null, 'ban-note'),
+      h('label', { class: 'chk' }, flagOn(b, 'ignore_case', 'Ban ' + (i + 1) + ': ignore case'), h('span', { text: 'Ignore case' })),
+      h('label', { class: 'chk' }, flagOn(b, 'enabled', 'Ban ' + (i + 1) + ': on'), h('span', { text: 'On' })),
+      h('button', { type: 'button', class: 'sm danger', text: 'Remove', 'aria-label': 'Remove ban ' + (i + 1), onclick: () => { cfg.bans.splice(i, 1); changed(); render(); } }))))
+      : h('p', { class: 'muted', text: 'No bans. Add a pattern to ignore a sender.' }));
+  };
+  render();
+  const add = h('button', { type: 'button', text: 'Add ban', onclick: () => {
+    cfg.bans.push({ pattern: '', ignore_case: true, enabled: true, note: '' }); changed(); render();
+    list.querySelector('.ban-row:last-child input').focus();
+  } });
+
+  const tname = h('input', { placeholder: 'Sender name', 'aria-label': 'Sender name to test', autocomplete: 'off', style: 'flex:1 1 12em;max-width:24em' });
+  const tres = h('div', { 'aria-live': 'polite' });
+  const tbtn = h('button', { type: 'button', text: 'Test', onclick: async () => {
+    const name = tname.value.trim();
+    if (!name) { tres.replaceChildren(h('p', { class: 'form-err', text: 'Type a sender name first.' })); return; }
+    tbtn.disabled = true; tres.replaceChildren(h('p', { class: 'muted', text: 'Waiting for the bot...' }));
+    const r = await runAction('ban_test', { name });
+    tbtn.disabled = false;
+    const res = r && r.result;
+    if (res && res.ok !== false && 'banned' in res) tres.replaceChildren(h('p', {}, res.banned ? h('span', { class: 'pill bad', text: 'banned' }) : h('span', { class: 'pill ok', text: 'not banned' }), ' ', h('span', { class: 'mono', text: res.name }), res.banned ? h('span', { class: 'muted', text: '  by ' + res.banned }) : null));
+    else tres.replaceChildren(r ? resultNode(r) : '');
+  } });
+  tname.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); tbtn.click(); } });
+
+  const active = h('div');
+  const refresh = () => {
+    const bans = (rt && rt.auto_bans) || [];
+    active.replaceChildren(bans.length ? h('div', { class: 'tablewrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Sender', 'Since', 'Until', 'Why', ''].map((t) => h('th', { text: t })))),
+      h('tbody', {}, bans.map((b) => {
+        const lift = h('button', { type: 'button', class: 'sm', text: 'Lift', 'aria-label': 'Lift the ban on ' + b.sender, onclick: async () => {
+          lift.disabled = true;
+          const r = await runAction('unban', { sender: b.sender });
+          lift.disabled = false;
+          if (r && r.result && r.result.ok !== false) toast(r.result.lifted ? 'Lifted the ban on ' + b.sender + '.' : b.sender + ' was not banned.');
+        } });
+        return h('tr', {}, h('td', { class: 'mono', text: b.sender }), h('td', { text: ago(b.since) }),
+          h('td', { text: new Date(b.until * 1000).toLocaleString() }), h('td', { class: 'muted', text: b.reason || '' }), h('td', {}, lift));
+      }))))
+      : h('p', { class: 'muted', text: rtState === 'ok' ? 'Nobody is banned automatically right now.' : 'Shown once the bot is running.' }));
+  };
+  refresh();
+
+  return { el: h('div', {},
+    h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Bans' }), add),
+      h('p', { text: 'The bot ignores a banned sender: no command replies and no unscoped replies. Their messages still count in the roster and traffic, since that is what the radio heard.' }),
+      h('p', { class: 'hint', text: 'Each pattern is a regular expression (Python syntax) searched anywhere in the sender\'s name, so anchor it to match a whole name: ^bob$. A channel sender is only a name, so anyone can use any name; on a DM the name is the contact name, or the first 8 hex digits of its key. Names are cut to 64 characters before matching. Avoid nested repeats such as (a+)+.' }),
+      list),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Test a name' }),
+      h('p', { class: 'hint', text: 'Checked by the bot against the saved bans and automatic bans. Save first to test edits.' }),
+      h('div', { class: 'row', style: 'flex-wrap:nowrap' }, tname, tbtn), tres),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Per-sender limits' }),
+      h('div', { class: 'grid' },
+        field('Gap between one sender\'s commands (s)', numIn(lim, 'user_cooldown_s', { min: 0 }), 'Across all commands.'),
+        field('Most answered commands per sender', numIn(lim, 'user_max_requests', { min: 0, max: 1000, step: 1 }), '0 turns this off.'),
+        field('In any (seconds)', numIn(lim, 'user_window_s', { min: 10, max: 86400 }), '600 = 10 minutes.')),
+      h('p', { class: 'hint', text: 'A command\'s own cooldown also follows the sender: asking again on another channel, in another region or by DM waits it out too.' })),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Automatic bans' }),
+      check('Ban a sender who keeps hitting the limits', ab, 'enabled'),
+      h('div', { class: 'grid' },
+        field('Refusals before a ban', numIn(ab, 'strikes', { min: 1, max: 1000, step: 1 }), 'Requests refused by the gap, a cooldown or the per-sender cap.'),
+        field('Within (seconds)', numIn(ab, 'window_s', { min: 10, max: 86400 })),
+        field('Ban for (hours)', numIn(ab, 'ban_h', { min: 0.1, max: 8760 }))),
+      h('p', { class: 'hint', text: 'The bot sends nothing when it bans someone; it shows here and in the activity log. Bans end on their own.' }),
+      active)), refresh };
 }
 
 // ---------------------------------------------------------------- tab: announcements
@@ -944,17 +1089,19 @@ function niceStep(max) { // tick step giving ~4 whole-number ticks
   const raw = Math.max(1, max) / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
   return Math.max(1, (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p);
 }
-function usageChart(d, host) {
+// o (optional): fixed series keys with colors and names, instead of the top commands.
+// { keys: [...], colors: {key: '--c1'}, names: {key: 'label'}, title, what, legend, none }
+function usageChart(d, host, o = {}) {
   const series = d.series || [];
   const totalBy = {};
   series.forEach((b) => Object.entries(b.counts || {}).forEach(([k, n]) => { totalBy[k] = (totalBy[k] || 0) + n; }));
   const trig = {}; (d.commands || []).forEach((c) => { trig[c.id] = c.trigger || c.id; });
-  const ranked = Object.keys(totalBy).filter((k) => totalBy[k] > 0).sort((a, b) => totalBy[b] - totalBy[a]);
-  const top = ranked.slice(0, 6);
-  const hasOther = ranked.length > 6;
+  const ranked = o.keys ? o.keys.filter((k) => totalBy[k] > 0) : Object.keys(totalBy).filter((k) => totalBy[k] > 0).sort((a, b) => totalBy[b] - totalBy[a]);
+  const top = o.keys ? ranked : ranked.slice(0, 6);
+  const hasOther = !o.keys && ranked.length > 6;
   const keys = hasOther ? [...top, 'other'] : top;
-  const colorOf = (k) => 'var(' + (k === 'other' ? '--c-other' : '--c' + (top.indexOf(k) + 1)) + ')';
-  const nameOf = (k) => (k === 'other' ? 'other (' + (ranked.length - 6) + (ranked.length === 7 ? ' command)' : ' commands)') : trig[k] || k);
+  const colorOf = (k) => 'var(' + (o.colors ? o.colors[k] : k === 'other' ? '--c-other' : '--c' + (top.indexOf(k) + 1)) + ')';
+  const nameOf = (k) => (o.names ? o.names[k] || k : k === 'other' ? 'other (' + (ranked.length - 6) + (ranked.length === 7 ? ' command)' : ' commands)') : trig[k] || k);
   const bucketCounts = (b) => {
     const out = {}; let other = 0;
     Object.entries(b.counts || {}).forEach(([k, n]) => { if (!n) return; if (top.includes(k)) out[k] = n; else other += n; });
@@ -964,7 +1111,7 @@ function usageChart(d, host) {
   const sums = series.map((b) => Object.values(b.counts || {}).reduce((a, n) => a + n, 0));
   const peak = Math.max(1, ...sums), tstep = niceStep(peak), ymax = Math.ceil(peak / tstep) * tstep;
   const tip = h('div', { class: 'chart-tip', hidden: true, role: 'presentation' });
-  const legend = h('ul', { class: 'legend', 'aria-label': 'Commands' }, keys.map((k) => h('li', {}, h('i', { style: 'background:' + colorOf(k) }), h('span', { class: 'mono', text: nameOf(k) }), h('span', { class: 'muted', text: String(k === 'other' ? ranked.slice(6).reduce((a, x) => a + totalBy[x], 0) : totalBy[k]) }))));
+  const legend = h('ul', { class: 'legend', 'aria-label': o.legend || 'Commands' }, keys.map((k) => h('li', {}, h('i', { style: 'background:' + colorOf(k) }), h('span', { class: 'mono', text: nameOf(k) }), h('span', { class: 'muted', text: String(k === 'other' ? ranked.slice(6).reduce((a, x) => a + totalBy[x], 0) : totalBy[k]) }))));
   const box = h('div', { class: 'chart-box' });
   let lastW = 0;
   const draw = () => {
@@ -975,7 +1122,7 @@ function usageChart(d, host) {
     const pw = W - L - R, ph = H - T - B, n = series.length || 1;
     const step = pw / n, bw = Math.max(1, Math.min(28, step * 0.72));
     const y = (v) => T + ph - (v / ymax) * ph;
-    const el = svg('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Stacked bars of command requests per ' + d.bucket + ', ' + d.label + '. Exact numbers are in the tables below.' });
+    const el = svg('svg', { width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Stacked bars of ' + (o.what || 'command requests') + ' per ' + d.bucket + ', ' + d.label + '. Exact numbers are in the tables below.' });
     for (let v = 0; v <= ymax; v += tstep) {
       const i = v;
       el.append(svg('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), class: i ? 'grid-line' : 'axis-line' }),
@@ -993,10 +1140,10 @@ function usageChart(d, host) {
         const y1 = y(acc + v), y0 = y(acc); acc += v;
         el.append(svg('rect', { x: x0, y: y1, width: bw, height: Math.max(0.5, y0 - y1), fill: colorOf(k), class: 'seg' }));
       });
-      const desc = b.label + ': ' + (sums[i] ? Object.entries(cnt).map(([k, v]) => nameOf(k) + ' ' + v).join(', ') + ' (total ' + sums[i] + ')' : 'no requests');
+      const desc = b.label + ': ' + (sums[i] ? Object.entries(cnt).map(([k, v]) => nameOf(k) + ' ' + v).join(', ') + ' (total ' + sums[i] + ')' : (o.none || 'No requests').toLowerCase());
       const hit = svg('rect', { x: L + step * i, y: T, width: step, height: ph, class: 'hit' }, svg('title', {}, desc));
       const show = () => {
-        tip.replaceChildren(h('b', { text: b.label }), ...(sums[i] ? Object.entries(cnt).map(([k, v]) => h('div', {}, h('i', { style: 'background:' + colorOf(k) }), h('span', { class: 'mono', text: nameOf(k) }), h('span', { text: String(v) }))) : [h('div', { class: 'muted', text: 'No requests' })]));
+        tip.replaceChildren(h('b', { text: b.label }), ...(sums[i] ? Object.entries(cnt).map(([k, v]) => h('div', {}, h('i', { style: 'background:' + colorOf(k) }), h('span', { class: 'mono', text: nameOf(k) }), h('span', { text: String(v) }))) : [h('div', { class: 'muted', text: o.none || 'No requests' })]));
         tip.hidden = false;
         const tw = tip.offsetWidth;
         tip.style.left = Math.max(0, Math.min(W - tw, cx - tw / 2)) + 'px';
@@ -1010,7 +1157,28 @@ function usageChart(d, host) {
   };
   if (window.ResizeObserver) new ResizeObserver(draw).observe(box);
   requestAnimationFrame(draw);
-  return h('div', { class: 'card' }, h('h3', { text: 'Requests per ' + d.bucket }), legend, box);
+  return h('div', { class: 'card' }, h('h3', { text: o.title || 'Requests per ' + d.bucket }), legend, box);
+}
+const TRAFFIC_CHART = { keys: ['unscoped', 'scoped', 'unknown', 'direct'],
+  colors: { unscoped: '--c2', scoped: '--c3', unknown: '--c-other', direct: '--c1' },
+  names: { unscoped: 'no region', scoped: 'in a region', unknown: 'could not tell', direct: 'direct' },
+  what: 'channel messages', legend: 'How messages were scoped', none: 'No messages' };
+function usageTraffic(d, host) {
+  const t = d.traffic;
+  if (!t) return [];
+  const tot = t.totals || {};
+  const pct = (v) => (v == null ? '-' : v + '%');
+  const stat = (v, l) => h('div', { class: 'counter' }, h('b', { text: String(v ?? 0) }), h('span', { text: l }));
+  const head = h('div', { class: 'card' }, h('h2', { text: 'Channel traffic by region' }),
+    h('p', { class: 'hint', text: 'Every channel message the radio heard, by whether it carried a region. "No region" is a plain flood, which every repeater forwards across the whole mesh. "Could not tell" means the packet could not be matched to the message; it is left out of the share.' }),
+    h('div', { class: 'counters' }, stat(tot.messages, 'messages'), stat(pct(tot.unscoped_pct), 'with no region'), stat(tot.nudges, 'unscoped replies sent')));
+  if (!tot.messages) return [head, h('div', { class: 'card usage-msg' }, h('b', { text: 'No channel messages heard in this window.' }))];
+  return [head,
+    usageChart({ series: t.series, bucket: t.bucket, label: d.label }, host, { ...TRAFFIC_CHART, title: 'Channel messages per ' + t.bucket }),
+    h('div', { class: 'grid wide' },
+      usageTable('Channels', [['Channel'], ['Messages', true], ['No region', true], ['In a region', true], ['Could not tell', true], ['No-region share', true], ['Replies sent', true]],
+        (t.channels || []).map((c) => [c.name, c.messages, c.unscoped, c.scoped, c.unknown, pct(c.unscoped_pct), c.nudges]), 'No channels.'),
+      usageTable('Messages in a region', [['Region'], ['Messages', true]], (t.regions || []).map((r) => [r.name, r.requests]), 'No messages carried a region.'))];
 }
 function usageTable(title, cols, rows, empty) {
   return h('div', { class: 'card' }, h('h3', { text: title }),
@@ -1051,6 +1219,7 @@ function tabUsage() {
           usageTable('Channels', [['Channel'], ['Requests', true]], (d.channels || []).map((x) => [x.name, x.requests]), 'No channels.'),
           usageTable('Regions', [['Region'], ['Requests', true]], (d.regions || []).map((x) => [x.name, x.requests]), 'No regions.')));
       }
+      body.push(...usageTraffic(d, out));
       kids.push(h('div', { class: 'usage-data' + (USAGE.loading ? ' dim' : ''), 'aria-busy': String(USAGE.loading) }, body));
     }
     if (USAGE.loading) kids.unshift(h('p', { class: 'muted usage-loading', role: 'status', text: d ? 'Updating...' : 'Loading usage...' }));
@@ -1069,7 +1238,7 @@ function tabUsage() {
 // ---------------------------------------------------------------- tab: activity / nodes
 const actFilter = new Set();
 function tabActivity() {
-  const KINDS = ['rx', 'reply', 'skip', 'announce', 'alert', 'tx', 'error'];
+  const KINDS = ['rx', 'reply', 'skip', 'nudge', 'ban', 'announce', 'alert', 'tx', 'error'];
   const log = h('div', { class: 'log', role: 'log', 'aria-label': 'Activity log' });
   const filters = h('div', { class: 'row' }, h('span', { class: 'muted', text: 'Show:' }), KINDS.map((k) => {
     const cb = h('input', { type: 'checkbox', checked: !actFilter.size || actFilter.has(k) });
@@ -1180,8 +1349,8 @@ function tabAdvanced() {
         field('Log level', sel(cfg, 'log_level', ['DEBUG', 'INFO', 'WARNING', 'ERROR'].map((x) => [x, x]))))),
     h('div', { class: 'card stack' }, h('h2', { text: 'Limits' }),
       h('div', { class: 'grid' },
-        field('Gap between transmissions (s)', numIn(cfg.limits, 'tx_gap_s', { min: 0 })), field('Max transmissions per minute', numIn(cfg.limits, 'tx_max_per_min', { min: 0, step: 1 })),
-        field('Per-user cooldown floor (s)', numIn(cfg.limits, 'user_cooldown_s', { min: 0 }), 'Applies across all commands.'))),
+        field('Gap between transmissions (s)', numIn(cfg.limits, 'tx_gap_s', { min: 0 })), field('Max transmissions per minute', numIn(cfg.limits, 'tx_max_per_min', { min: 0, step: 1 }))),
+      h('p', { class: 'hint', text: 'Per-sender limits are on the Moderation tab.' })),
     h('div', { class: 'card stack' }, h('h2', { text: 'Raw JSON' }),
       h('p', { class: 'hint', text: 'The whole configuration, including keys this console does not know about. Applying replaces the form state; nothing is saved until you press Save.' }),
       raw, h('div', { class: 'row' },
@@ -1193,7 +1362,7 @@ function tabAdvanced() {
 }
 
 // ---------------------------------------------------------------- shell
-const BUILDERS = { status: tabStatus, commands: tabCommands, scope: tabScope, announce: tabAnnounce, weather: tabWeather, send: tabSend, activity: tabActivity, usage: tabUsage, nodes: tabNodes, corescope: tabCoreScope, advanced: tabAdvanced };
+const BUILDERS = { status: tabStatus, commands: tabCommands, scope: tabScope, moderation: tabModeration, announce: tabAnnounce, weather: tabWeather, send: tabSend, activity: tabActivity, usage: tabUsage, nodes: tabNodes, corescope: tabCoreScope, advanced: tabAdvanced };
 
 function renderTabs() {
   const nav = $('#tabs');

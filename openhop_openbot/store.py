@@ -74,12 +74,55 @@ CREATE TABLE IF NOT EXISTS usage (
     sender  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts);
+
+-- Channel messages heard, per hour, channel and how they were scoped.
+CREATE TABLE IF NOT EXISTS traffic (
+    hour    INTEGER NOT NULL,     -- epoch seconds // 3600
+    channel TEXT NOT NULL,
+    scope   TEXT NOT NULL,        -- '#region', 'other', '*', '?' or 'direct'
+    count   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour, channel, scope)
+);
+
+-- Answered requests per sender, for the per-sender burst cap.
+CREATE TABLE IF NOT EXISTS hits (
+    id     INTEGER PRIMARY KEY,
+    sender TEXT NOT NULL,         -- lowercase
+    ts     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS hits_sender ON hits (sender, ts);
+
+-- Requests refused by a rate limit, for automatic bans.
+CREATE TABLE IF NOT EXISTS strikes (
+    id     INTEGER PRIMARY KEY,
+    sender TEXT NOT NULL,         -- lowercase
+    ts     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS strikes_sender ON strikes (sender, ts);
+
+CREATE TABLE IF NOT EXISTS auto_bans (
+    sender TEXT PRIMARY KEY,      -- lowercase
+    since  REAL NOT NULL,
+    until  REAL NOT NULL,
+    reason TEXT
+);
+
+-- Replies sent to senders heard unscoped, for the per-sender and channel caps.
+CREATE TABLE IF NOT EXISTS nudges (
+    id      INTEGER PRIMARY KEY,
+    ts      REAL NOT NULL,
+    channel TEXT NOT NULL,        -- normalised: lowercase, no leading '#'
+    sender  TEXT NOT NULL         -- lowercase
+);
+CREATE INDEX IF NOT EXISTS nudges_channel ON nudges (channel, ts);
 """
 
 MSG_RETENTION_S = 7 * 86400
 EDGE_RETENTION_S = 14 * 86400
 NODE_RETENTION_S = 60 * 86400
 USAGE_RETENTION_S = 366 * 86400
+TRAFFIC_RETENTION_S = 366 * 86400
+LIMIT_RETENTION_S = 2 * 86400       # hits and strikes: longer than any limit window
 
 
 def _row(r: sqlite3.Row) -> Dict[str, Any]:
@@ -341,6 +384,109 @@ class Store:
     def clear_fires(self) -> int:
         return self._x("DELETE FROM fires")
 
+    # ------------------------------------------------------- burst limit ---
+
+    def take_hit(self, sender: str, max_n: int, window_s: float,
+                 now: Optional[float] = None) -> Optional[int]:
+        """Count one answered request for ``sender`` unless they already have
+        ``max_n`` in the last ``window_s``. Returns the row id to give back
+        with ``drop_hit``, or None when the cap is reached. Atomic."""
+        now = time.time() if now is None else now
+        with self._lock:
+            (n,) = self._db.execute(
+                "SELECT count(*) FROM hits WHERE sender = ? AND ts > ?",
+                (sender, now - window_s)).fetchone()
+            if n >= max_n:
+                return None
+            return self._db.execute("INSERT INTO hits (sender, ts) VALUES (?,?)",
+                                    (sender, now)).lastrowid
+
+    def drop_hit(self, row_id: int) -> None:
+        self._x("DELETE FROM hits WHERE id = ?", (row_id,))
+
+    # --------------------------------------------------------------- bans ---
+
+    def add_strike(self, sender: str, window_s: float, now: Optional[float] = None) -> int:
+        """Record one rate-limit refusal; return how many ``sender`` has in the
+        last ``window_s``, this one included."""
+        now = time.time() if now is None else now
+        with self._lock:
+            self._db.execute("INSERT INTO strikes (sender, ts) VALUES (?,?)", (sender, now))
+            (n,) = self._db.execute(
+                "SELECT count(*) FROM strikes WHERE sender = ? AND ts > ?",
+                (sender, now - window_s)).fetchone()
+            return n
+
+    def auto_ban(self, sender: str, until: float, reason: str,
+                 now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO auto_bans (sender, since, until, reason) VALUES (?,?,?,?)
+                   ON CONFLICT (sender) DO UPDATE SET since = excluded.since,
+                       until = excluded.until, reason = excluded.reason""",
+                (sender, now, until, reason))
+            self._db.execute("DELETE FROM strikes WHERE sender = ?", (sender,))
+
+    def auto_ban_until(self, sender: str, now: Optional[float] = None) -> Optional[float]:
+        now = time.time() if now is None else now
+        rows = self._q("SELECT until FROM auto_bans WHERE sender = ? AND until > ?",
+                       (sender, now))
+        return rows[0][0] if rows else None
+
+    def auto_bans(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        now = time.time() if now is None else now
+        rows = self._q("""SELECT sender, since, until, reason FROM auto_bans
+                          WHERE until > ? ORDER BY until""", (now,))
+        return [_row(r) for r in rows]
+
+    def lift_auto_ban(self, sender: str) -> bool:
+        with self._lock:
+            n = self._db.execute("DELETE FROM auto_bans WHERE sender = ?", (sender,)).rowcount
+            self._db.execute("DELETE FROM strikes WHERE sender = ?", (sender,))
+            return n > 0
+
+    # ------------------------------------------------------------ traffic ---
+
+    def count_traffic(self, channel: str, scope: str, ts: Optional[float] = None) -> None:
+        hour = int((time.time() if ts is None else ts) // 3600)
+        self._x(
+            """INSERT INTO traffic (hour, channel, scope, count) VALUES (?,?,?,1)
+               ON CONFLICT (hour, channel, scope) DO UPDATE SET count = count + 1""",
+            (hour, channel, scope))
+
+    def traffic_rows(self, since: float, until: float) -> List[Dict[str, Any]]:
+        """Hourly rows overlapping [since, until), with ``ts`` = the hour's start."""
+        rows = self._q(
+            """SELECT hour * 3600 AS ts, channel, scope, count FROM traffic
+               WHERE hour >= ? AND hour * 3600 < ? ORDER BY hour""",
+            (int(since // 3600), until))
+        return [_row(r) for r in rows]
+
+    def take_nudge(self, channel: str, sender: str, per_sender: int, per_channel: int,
+                   window_s: float, now: Optional[float] = None) -> bool:
+        """Record one nudge unless ``sender`` already had ``per_sender`` or the
+        channel ``per_channel`` in the last ``window_s``. Atomic."""
+        now = time.time() if now is None else now
+        since = now - window_s
+        with self._lock:
+            (mine,) = self._db.execute(
+                "SELECT count(*) FROM nudges WHERE channel = ? AND sender = ? AND ts > ?",
+                (channel, sender, since)).fetchone()
+            (all_,) = self._db.execute(
+                "SELECT count(*) FROM nudges WHERE channel = ? AND ts > ?",
+                (channel, since)).fetchone()
+            if mine >= per_sender or all_ >= per_channel:
+                return False
+            self._db.execute("INSERT INTO nudges (ts, channel, sender) VALUES (?,?,?)",
+                             (now, channel, sender))
+            return True
+
+    def nudge_rows(self, since: float, until: float) -> List[Dict[str, Any]]:
+        rows = self._q("SELECT ts, channel, sender FROM nudges WHERE ts >= ? AND ts < ?",
+                       (since, until))
+        return [_row(r) for r in rows]
+
     # ---------------------------------------------------------- retention --
 
     def prune(self, now: Optional[int] = None) -> None:
@@ -350,3 +496,8 @@ class Store:
         self._x("DELETE FROM nodes WHERE last_heard < ?", (now - NODE_RETENTION_S,))
         self._x("DELETE FROM fires WHERE last_fired < ?", (now - 7 * 86400,))
         self._x("DELETE FROM usage WHERE ts < ?", (now - USAGE_RETENTION_S,))
+        self._x("DELETE FROM traffic WHERE hour < ?", ((now - TRAFFIC_RETENTION_S) // 3600,))
+        self._x("DELETE FROM nudges WHERE ts < ?", (now - TRAFFIC_RETENTION_S,))
+        self._x("DELETE FROM hits WHERE ts < ?", (now - LIMIT_RETENTION_S,))
+        self._x("DELETE FROM strikes WHERE ts < ?", (now - LIMIT_RETENTION_S,))
+        self._x("DELETE FROM auto_bans WHERE until < ?", (now,))

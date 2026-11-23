@@ -178,7 +178,7 @@ async def test_execute_usage(hub):
     await deliver(hub, "bob: !ping")
     out = await hub.execute("usage", {"range": "24h"})
     assert set(out) == {"tz", "from", "to", "label", "bucket", "totals", "commands",
-                        "series", "requesters", "channels", "regions", "skipped"}
+                        "series", "requesters", "channels", "regions", "skipped", "traffic"}
     assert out["totals"] == {"requests": 1, "answered": 1, "skipped": 0}
     assert out["commands"][0]["trigger"] == "!ping"
     with pytest.raises(ValueError):

@@ -35,8 +35,18 @@
     "tx_gap_s": 2.5,
     "tx_max_per_min": 8,
     "user_cooldown_s": 5,
+    "user_max_requests": 8,
+    "user_window_s": 600,
     "reply_in_request_region": true
   },
+  "bans": [],
+  "auto_ban": {
+    "enabled": false,
+    "strikes": 5,
+    "window_s": 600,
+    "ban_h": 24
+  },
+  "nudges": [],
   "commands": [
     {
       "id": "path",

@@ -28,8 +28,12 @@ _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 def skip_category(reason: str) -> str:
     low = (reason or "").lower()
+    if low.startswith("banned"):
+        return "banned"
     if "cooldown" in low:
         return "cooldown"
+    if "rate limit" in low:
+        return "rate limit"
     if ("not in scope" in low or "protected channel" in low or "dms not allowed" in low
             or "dm" in low.split() or "hops >" in low):
         return "out of scope"
@@ -153,4 +157,77 @@ def summarize(rows: Sequence[Mapping[str, Any]], window: Mapping[str, Any], tz: 
         "regions": _ranked(regions),
         "skipped": [{"reason": k, "count": v}
                     for k, v in sorted(skipped.items(), key=lambda kv: (-kv[1], kv[0]))],
+    }
+
+
+# Traffic scope classes, as mesh.frames.frame_scope returns them.
+_UNSCOPED, _UNKNOWN, _DIRECT, _OTHER = "*", "?", "direct", "other"
+TRAFFIC_KEYS = ("scoped", "unscoped", "unknown", "direct")
+
+
+def _traffic_class(scope: str) -> str:
+    if scope == _UNSCOPED:
+        return "unscoped"
+    if scope == _UNKNOWN:
+        return "unknown"
+    if scope == _DIRECT:
+        return "direct"
+    return "scoped"            # a configured '#region', or 'other'
+
+
+def _pct(unscoped: int, scoped: int) -> Any:
+    """Unscoped share of the messages whose scope is known, or None."""
+    known = unscoped + scoped
+    return round(100.0 * unscoped / known, 1) if known else None
+
+
+def summarize_traffic(rows: Sequence[Mapping[str, Any]], nudges: Sequence[Mapping[str, Any]],
+                      window: Mapping[str, Any], tz: str) -> Dict[str, Any]:
+    """Channel traffic by how it was scoped, over the same buckets as ``summarize``.
+
+    ``rows`` are the store's hourly traffic rows (``ts`` = the hour's start);
+    an hour that straddles the window's start counts in full. Unknown means
+    the frame could not be matched to the message; it is left out of the
+    unscoped share rather than counted either way.
+    """
+    zone = _zone(tz)
+    bucket = window["bucket"]
+    starts = _bucket_starts(window["from"], window["to"], bucket, zone)
+    series: List[Dict[str, int]] = [dict.fromkeys(TRAFFIC_KEYS, 0) for _ in starts]
+    channels: Dict[str, Dict[str, Any]] = {}
+    regions: Counter = Counter()
+    totals = dict.fromkeys(TRAFFIC_KEYS, 0)
+    for r in rows:
+        if r["ts"] + 3600 <= window["from"] or r["ts"] >= window["to"]:
+            continue
+        cls, n = _traffic_class(r["scope"]), int(r["count"])
+        totals[cls] += n
+        ch = channels.setdefault(r["channel"], {"name": r["channel"], **dict.fromkeys(
+            TRAFFIC_KEYS, 0), "nudges": 0})
+        ch[cls] += n
+        if cls == "scoped":
+            regions["other regions" if r["scope"] == _OTHER else r["scope"]] += n
+        if starts:
+            i = max(0, bisect_right(starts, r["ts"]) - 1)
+            series[i][cls] += n
+    sent = Counter(str(x["channel"]) for x in nudges)
+    by_norm = {c.lstrip("#").lower(): c for c in channels}
+    for norm, n in sent.items():
+        name = by_norm.get(norm, "#" + norm)
+        channels.setdefault(name, {"name": name, **dict.fromkeys(TRAFFIC_KEYS, 0),
+                                   "nudges": 0})["nudges"] += n
+    out_channels = []
+    for ch in channels.values():
+        ch["messages"] = sum(ch[k] for k in TRAFFIC_KEYS)
+        ch["unscoped_pct"] = _pct(ch["unscoped"], ch["scoped"])
+        out_channels.append(ch)
+    out_channels.sort(key=lambda c: (-c["messages"], c["name"]))
+    return {
+        "bucket": bucket,
+        "totals": {**totals, "messages": sum(totals.values()), "nudges": len(nudges),
+                   "unscoped_pct": _pct(totals["unscoped"], totals["scoped"])},
+        "series": [{"t": t, "label": _label(t, bucket, zone), "counts": c}
+                   for t, c in zip(starts, series)],
+        "channels": out_channels,
+        "regions": _ranked(regions),
     }

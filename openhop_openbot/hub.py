@@ -32,14 +32,18 @@ from .engine.builtins import BUILTINS, builtin_help
 from .engine.pathresolve import split_chain
 from .engine.schedule import Schedule
 from .engine.templates import clamp_bytes, render
-from .engine.usage import parse_window, skip_category, summarize
+from .engine.moderation import sender_key
+from .engine.usage import parse_window, skip_category, summarize, summarize_traffic
 from .mesh.companion import Advert, CompanionClient, Message
 from .mesh.correlate import FrameCorrelator, region_of
 from .mesh.frames import (
     REGION_UNKNOWN,
+    REGION_UNSCOPED,
     canonical_region,
     channel_hash_byte,
     decode_advert_frame,
+    frame_scope,
+    group_text_plain,
     hashtag_secret,
     region_key,
 )
@@ -109,6 +113,7 @@ class Hub:
         self.region_keys: Dict[str, bytes] = {}
         self._rebuild_regions()
         self.slots: Dict[int, Dict[str, Any]] = {}       # idx -> {name, ok}
+        self.channel_secrets: Dict[int, bytes] = {}      # idx -> key, for configured slots
         self._contacts: Dict[bytes, str] = {}            # 6-byte prefix -> name
         self._last_rssi: Optional[int] = None
 
@@ -322,6 +327,7 @@ class Hub:
             try:
                 secret = bytes.fromhex(entry["secret"]) if entry.get("secret") \
                     else hashtag_secret(name)
+                self.channel_secrets[idx] = secret
                 self.correlator.channel_hashes[idx] = channel_hash_byte(secret)
                 ok = await self.client.set_channel(idx, name, secret)
                 logger.info("channel slot %s = %r -> %s", idx, name, "ok" if ok else "REFUSED")
@@ -398,12 +404,18 @@ class Hub:
                               path=">".join(req.hops) or None, ts=req.ts)
         if req.hops:
             self.store.record_chain(req.hops)
+        if not req.is_dm and not self._is_me(req.sender):
+            self.store.count_traffic(req.channel, req.scope, req.heard_at)
+            await self._maybe_nudge(req)
         if not self.engine.find_command(req.text):
             return
         self.counters["commands"] += 1
         self.log_activity("rx", channel=req.channel, region=req.region, sender=req.sender,
                           text=req.text)
         result = await asyncio.to_thread(self.engine.handle, req)
+        if result.auto_banned:
+            self.log_activity("ban", channel=req.channel, region=req.region,
+                              sender=req.sender, detail=result.reason)
         if result.matched:
             answered = bool(result.reply)
             try:
@@ -468,6 +480,54 @@ class Hub:
         self.log_activity("reply", channel=req.channel, region=req.region, sender=req.sender,
                           text=text, detail="%s (follow-up)" % cid)
 
+    def _is_me(self, sender: str) -> bool:
+        me = (self.node.get("name") or "").strip().lower()
+        return bool(me) and sender.strip().lower() == me
+
+    def _secret_for(self, idx: Optional[int]) -> Optional[bytes]:
+        if idx is None:
+            return None
+        if idx in self.channel_secrets:
+            return self.channel_secrets[idx]
+        name = (self.slots.get(idx) or {}).get("name") or ""
+        if name.startswith("#"):
+            with contextlib.suppress(ValueError):
+                return hashtag_secret(name)
+        return None
+
+    def _verify_unscoped(self, msg: Message, frame) -> bool:
+        """The frame is a plain flood that decrypts, with this slot's key, to
+        exactly this message: the evidence a nudge needs. The structural match
+        the correlator makes is good enough to count traffic, not to tell
+        someone their message had no region."""
+        if frame is None or msg.channel_idx is None:
+            return False
+        if frame_scope(frame.hdr, self.region_keys) != REGION_UNSCOPED:
+            return False
+        secret = self._secret_for(msg.channel_idx)
+        if secret is None:
+            return False
+        plain = group_text_plain(secret, frame.hdr.get("payload") or b"")
+        return plain is not None and plain[0] == msg.timestamp \
+            and plain[1].strip() == msg.text.strip()
+
+    async def _maybe_nudge(self, req: Request) -> None:
+        if not req.unscoped_verified:
+            return
+        try:
+            rule, text = await asyncio.to_thread(self.engine.nudge, req)
+        except Exception as exc:
+            logger.error("nudge failed: %s", exc, exc_info=True)
+            return
+        if rule is None:
+            return
+        text = clamp_bytes(text)
+        self.tx.put(TxJob(text=text, channel_idx=req.channel_idx,
+                          scope=self.scope_for(str(rule.get("region") or "")),
+                          label="nudge:%s" % req.channel))
+        self.log_activity("nudge", channel=req.channel, region=req.region,
+                          sender=req.sender, text=text)
+
     def _request_from(self, msg: Message) -> Optional[Request]:
         frame = self.correlator.claim(msg)
         # When the radio heard it: the frame's receive time (monotonic) moved
@@ -501,10 +561,13 @@ class Hub:
         channel = slot["name"] if slot else str(msg.channel_idx)
         if msg.channel_idx == 0 and not slot:
             channel = "Public"
+        scope = frame_scope(frame.hdr if frame else None, self.region_keys)
+        verified = (scope == REGION_UNSCOPED and self.engine.nudge_rule(channel) is not None
+                    and self._verify_unscoped(msg, frame))
         return Request(sender=sender, text=body, channel=channel, channel_idx=msg.channel_idx,
                        region=region, hops_n=hops_n, hops=hops, hash_size=hash_size, snr=snr,
                        rssi=rssi, ts=msg.timestamp, packet_hash=frame.hash if frame else None,
-                       heard_at=heard_at)
+                       heard_at=heard_at, scope=scope, unscoped_verified=verified)
 
     # ---------------------------------------------------------- transmit ----
 
@@ -636,7 +699,13 @@ class Hub:
             tz = (self.cfg.get("node") or {}).get("timezone") or "America/Chicago"
             window = parse_window(args, time.time(), tz)
             rows = await asyncio.to_thread(self.store.usage_rows, window["from"], window["to"])
-            return summarize(rows, window, tz, self.engine.commands())
+            out = summarize(rows, window, tz, self.engine.commands())
+            traffic = await asyncio.to_thread(self.store.traffic_rows, window["from"],
+                                              window["to"])
+            nudges = await asyncio.to_thread(self.store.nudge_rows, window["from"],
+                                             window["to"])
+            out["traffic"] = summarize_traffic(traffic, nudges, window, tz)
+            return out
         if action == "advert":
             flood = args.get("flood", True)
             if not isinstance(flood, bool):
@@ -665,6 +734,19 @@ class Hub:
             return {"queued": await asyncio.to_thread(self._announce, ann)}
         if action == "clear_cooldowns":
             return {"cleared": self.store.clear_fires()}
+        if action == "ban_test":
+            name = str(args.get("name") or "").strip()
+            if not name:
+                raise ValueError("give a name to test")
+            return {"name": name, "banned": self.engine.ban_reason(name)}
+        if action == "unban":
+            sender = sender_key(args.get("sender"))
+            if not sender:
+                raise ValueError("give the sender to unban")
+            lifted = self.store.lift_auto_ban(sender)
+            if lifted:
+                self.log_activity("ban", sender=sender, detail="automatic ban lifted")
+            return {"sender": sender, "lifted": lifted}
         if action == "provision_channels":
             if not self.client.is_connected():
                 raise ValueError("companion not connected")
@@ -691,9 +773,14 @@ class Hub:
             hops=hops, hash_size=hash_size, snr=args.get("snr"),
         )
         res = self.engine.handle(req, dry_run=True)
-        return {"matched": res.matched, "reply": res.reply, "extra": res.extra,
-                "reason": res.reason,
-                "bytes": len(res.reply.encode("utf-8"))}
+        out = {"matched": res.matched, "reply": res.reply, "extra": res.extra,
+               "reason": res.reason,
+               "bytes": len(res.reply.encode("utf-8"))}
+        if req.region == REGION_UNSCOPED:
+            nudge = self.engine.nudge_preview(req)
+            if nudge:
+                out["nudge"] = clamp_bytes(nudge)
+        return out
 
     # ----------------------------------------------------------- runtime ----
 
@@ -729,6 +816,7 @@ class Hub:
                        "recent": recent},
             "builtins": builtin_help(),
             "commands": [{"id": k, **v} for k, v in self.cmd_stats.items()],
+            "auto_bans": self.store.auto_bans(),
             "mailbox": {"processed": list(self.mailbox_done),
                         "results": copy.deepcopy(self.mailbox_results)},
         }
