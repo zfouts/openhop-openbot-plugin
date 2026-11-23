@@ -97,10 +97,12 @@ A request that passes scope must also pass, in order:
 | The command's own cooldown | `commands[].cooldown_s` | per command | `command cooldown` |
 | Answered commands per sender per window | `limits.user_max_requests` per `limits.user_window_s` | `8` per `600` | `requester rate limit (N per Ws)` |
 
-A sender is their name, compared case-insensitively. All three follow the
-sender across channels, regions and DMs. `user_max_requests` `0` turns the
-cap off; `user_window_s` is 10-86400. A reply that renders empty gives back
-what it took. Dry runs (`test`) skip these limits.
+Limits are kept per sender identity: on a channel the sender's name,
+case-insensitively (a channel message carries nothing else); on a DM
+`dm:` and the sender's 6-byte public key prefix in hex. All three follow a
+channel sender across channels and regions. `user_max_requests` `0` turns
+the cap off; `user_window_s` is 10-86400. A reply that renders empty gives
+back what it took. Dry runs (`test`) skip these limits.
 
 ### Bans
 
@@ -115,16 +117,23 @@ still count in the roster and traffic.
 
 `bans[].pattern` is a Python regular expression searched anywhere in the
 sender's name (cut to 64 characters); anchor it (`^bob$`) to match a whole
-name. `ignore_case` and `enabled` default to `true`. An empty pattern or one
-that does not compile is skipped and reported in `config_problems`. On a DM
-the name is the contact's name, or the first 8 hex digits of its public key
-when the contact is unknown.
+name. `ignore_case` and `enabled` default to `true`. A pattern that is empty,
+does not compile, or matches an empty name (so would match everyone, such as
+`spammer|`) is skipped and reported in `config_problems`, as is a `bans`
+that is not a list. Rules are numbered by their position as written
+(`ban #3`). On a DM the name is the contact's name, or the first 8 hex digits
+of its public key when the contact is unknown.
 
-With `auto_ban.enabled`, every request refused by a per-sender limit is a
-strike. `strikes` (1-1000) within `window_s` (10-86400) bans that sender for
-`ban_h` hours (0.1-8760). Automatic bans live in `openbot.db`, not in
-config; they show in `runtime.auto_bans` and end on their own, or with the
-`unban` action. The bot transmits nothing when it bans someone.
+With `auto_ban.enabled`, every request refused by the per-sender cap
+(`requester rate limit`) is a strike; cooldown refusals are not, since that
+is what a retry over a lossy link looks like. `strikes` (1-1000) within
+`window_s` (10-86400) bans that identity for `ban_h` hours (0.1-8760). With
+`limits.user_max_requests` `0` nothing is counted, which is reported.
+Automatic bans live in `openbot.db`, not in config; they show in
+`runtime.auto_bans` (by identity, so a DM sender is `dm:<hex>`) and end on
+their own, or with the `unban` action. The bot transmits nothing when it bans
+someone. Anyone can type any name on a channel, so a name can be banned by
+someone flooding as it; a DM identity can not.
 
 ### Unscoped traffic and replies
 
@@ -140,12 +149,18 @@ be matched) or `direct`. Counts are kept 366 days and reported by `usage`.
 ```
 
 A `nudges` entry turns on, for one channel, a reply to anyone heard sending
-a plain, unscoped flood there. The bot replies only when the frame it heard
-was a plain flood **and** decrypts, with that channel's key, to exactly the
-message (same text and timestamp); a message it cannot verify is never
-answered. Each sender gets at most `per_sender` (1-100) and the channel at
-most `per_channel` (1-1000) in any `window_h` hours (0.1-720); both count
-replies queued. `text` is a template, rendered with the message's context.
+a plain, unscoped flood there. The bot considers a reply only when the frame
+it heard was a plain flood **and** decrypts, with that channel's key, to
+exactly the message (same text and timestamp); a message it cannot verify is
+never answered. It then waits 8 seconds and sends nothing if any copy of the
+same packet carrying transport codes was heard meanwhile (or in the 2 minutes
+before), since the plain copy may be a replay or a bridge's. The key is the
+slot's `secret` or hashtag key from `channels`, or Public's well-known key;
+a channel whose key the bot does not have never gets a reply, which is
+logged once. Each sender gets at most `per_sender` (1-100) on that channel,
+and the channel at most `per_channel` (1-1000), in any `window_h` hours
+(0.1-720); both count replies queued, and one the send queue refuses is given
+back. `text` is a template, rendered with the message's context.
 `region` is where the reply is sent: `""` the companion default, `*`
 unscoped, `#name` that region. No reply goes to a banned sender, the bot
 itself, a request over `scope.max_hops`, or a protected channel: an entry for
@@ -291,7 +306,7 @@ comes back as the action's error.
   "builtins": [{"name": "path", "help": "..."}],
   "commands": [{"id": "path", "fires": 3, "last_fired": 1731170000}],
   "auto_bans": [{"sender": "bob", "since": 1731160000.0, "until": 1731246400.0,
-                 "reason": "5 rate-limit refusals in 600s"}],
+                 "reason": "5 refusals by the per-sender cap in 600s"}],
   "mailbox": {"processed": ["c-..."], "results": {"c-...": {"ok": true}}}
 }
 ```

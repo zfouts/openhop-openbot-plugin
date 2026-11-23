@@ -74,12 +74,43 @@ def test_ban_case_sensitivity_is_per_rule():
     assert eng.handle(req(sender="bob")).reply
 
 
-def test_bad_ban_pattern_is_reported_and_skipped():
+def test_bad_ban_patterns_are_reported_skipped_and_keep_numbering():
     cfg = copy.deepcopy(DEFAULTS)
-    cfg["bans"] = [{"pattern": "(unclosed"}, {"pattern": ""}, "^ok$"]
+    cfg["bans"] = [{"pattern": "(unclosed"}, {"pattern": ""}, "spammer|", 7, "^ok$"]
     out, problems = validate(cfg)
-    assert [b["pattern"] for b in out["bans"]] == ["^ok$"]
-    assert len(problems) == 2 and "unterminated" in problems[0]
+    assert len(problems) == 4 and "unterminated" in problems[0]
+    assert "everyone" in problems[2]
+    eng, _ = make()
+    eng.cfg["bans"] = out["bans"]
+    assert eng.handle(req(sender="bob")).reply                # nothing bans everyone
+    assert eng.ban_reason("OK") == "ban #5 ^ok$"              # numbered as written
+
+
+@pytest.mark.parametrize("key,value", [("bans", "^bob$"), ("limits", None),
+                                       ("auto_ban", ["on"]), ("nudges", {"channel": "#bot"})])
+def test_wrong_types_are_reported_not_fatal(key, value):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg[key] = value
+    out, problems = validate(cfg)
+    assert any(key in p for p in problems)
+    eng, _ = make({k: out[k] for k in ("bans", "limits", "auto_ban", "nudges")})
+    eng.cfg["limits"]["user_cooldown_s"] = 0
+    assert eng.handle(req(sender="bob")).reply
+
+
+@pytest.mark.parametrize("value", [1e999, "1e999", True, "lots", -1, 2.5])
+def test_bad_numbers_fall_back_to_defaults(value):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["limits"]["user_max_requests"] = value
+    out, problems = validate(cfg)
+    assert out["limits"]["user_max_requests"] == 8 and len(problems) == 1
+
+
+def test_auto_ban_without_the_cap_is_reported():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["limits"]["user_max_requests"] = 0
+    cfg["auto_ban"] = {"enabled": True}
+    assert any("nobody will be banned" in p for p in validate(cfg)[1])
 
 
 def test_banned_requests_hold_no_cooldown_and_dry_run_sees_bans():
@@ -110,28 +141,62 @@ def test_burst_slot_is_given_back_when_the_reply_is_empty():
     assert eng.handle(req("!ping"), now=1001).reply
 
 
-def test_auto_ban_after_repeated_refusals():
+def capped(eng, strikes=2, n=1):
+    eng.cfg["limits"].update(user_max_requests=n, user_window_s=600)
+    eng.cfg["auto_ban"] = {"enabled": True, "strikes": strikes, "window_s": 600, "ban_h": 1}
+
+
+def test_auto_ban_after_repeated_refusals_by_the_cap():
     eng, store = make()
-    eng.cfg["limits"]["user_cooldown_s"] = 30
-    eng.cfg["auto_ban"] = {"enabled": True, "strikes": 2, "window_s": 600, "ban_h": 1}
+    capped(eng)
     assert eng.handle(req("!ping"), now=1000).reply
     first = eng.handle(req("!stats"), now=1001)
-    assert first.reason == "requester cooldown" and not first.auto_banned
-    second = eng.handle(req("!stats"), now=1002)
+    assert first.reason.startswith("requester rate limit") and not first.auto_banned
+    second = eng.handle(req("!seen x"), now=1002)
     assert second.auto_banned and "banned automatically for 1h" in second.reason
-    assert skip_category(second.reason) == "cooldown"
+    assert skip_category(second.reason) == "rate limit"
     assert eng.handle(req("!ping"), now=1100).reason.startswith("banned (automatic ban")
     assert [b["sender"] for b in store.auto_bans(now=1100)] == ["bob"]
     assert eng.handle(req("!ping"), now=1002 + 3601).reply     # an hour after it began
     assert eng.handle(req("!ping", sender="amy"), now=1100).reply
 
 
+def test_cooldown_refusals_never_strike():
+    eng, store = make()
+    capped(eng, strikes=1, n=100)
+    eng.cfg["limits"]["user_cooldown_s"] = 30
+    for t in range(1000, 1020):                               # an honest retrier
+        eng.handle(req("!ping"), now=t)
+    assert not store.auto_bans(now=1020)
+
+
 def test_auto_ban_off_never_bans():
     eng, store = make()
-    eng.cfg["limits"]["user_cooldown_s"] = 30
+    eng.cfg["limits"].update(user_max_requests=1, user_window_s=600)
     for t in range(1000, 1010):
-        eng.handle(req("!ping"), now=t)
+        eng.handle(req("!seen x"), now=t)
     assert not store.auto_bans(now=1010)
+
+
+def dm(text="!ping", sender="alice", key=b"\xa1\xa2\xa3\xa4\xa5\xa6"):
+    return req(text, sender=sender, channel="dm", channel_idx=None, sender_prefix=key)
+
+
+def test_a_name_on_a_channel_can_not_lock_its_owner_out_of_dms():
+    eng, store = make()
+    capped(eng, strikes=1)
+    assert eng.handle(req("!ping", sender="Alice"), now=1000).reply   # an impostor
+    assert eng.handle(req("!stats", sender="Alice"), now=1001).auto_banned
+    assert eng.handle(req("!ping", sender="alice"), now=1002).reason.startswith("banned")
+    res = eng.handle(dm(), now=1002)                          # the real alice, by key
+    assert res.reply and res.matched == "ping"
+
+
+def test_dm_limits_follow_the_key_not_the_name():
+    eng, _ = make()
+    assert eng.handle(dm(sender="alice"), now=1000).reply
+    assert eng.handle(dm(sender="renamed"), now=1001).reason == "command cooldown"
+    assert eng.handle(dm(key=b"\xb0" * 6), now=1001).reply
 
 
 def test_lifting_an_auto_ban_clears_strikes():
@@ -205,14 +270,25 @@ def hub(tmp_path):
     h.slots = {1: {"name": "#bot", "ok": True}}
     h.correlator.channel_hashes[1] = chan_hash("#bot")
     h.node.update(name="openbot")
+    h.nudge_settle_s = 0
     return h
 
 
-async def say(h, text, *, frame=True, **frame_kw):
-    raw, pl = grp_frame(text, **{"real": True, **frame_kw})
+async def settle(h):
+    import asyncio
+
+    while h._nudges_waiting:
+        await asyncio.gather(*list(h._nudges_waiting))
+
+
+async def say(h, text, *, frame=True, idx=1, ts=TS, **frame_kw):
+    raw, pl = grp_frame(text, **{"real": True, "ts": ts, **frame_kw})
     if frame:
         await h._on_raw_frame(raw, 6.0, -90)
-    await h._on_message(channel_msg(text, pl))
+    msg = channel_msg(text, pl, idx=idx)
+    msg.timestamp = ts
+    await h._on_message(msg)
+    await settle(h)
 
 
 def nudges(h):
@@ -242,6 +318,68 @@ async def test_nudge_caps_per_sender_and_per_channel(hub):
     await say(hub, "amy: one")
     await say(hub, "cy: one")                              # channel cap of 2 reached
     assert [j.text.split("]")[0] for j in nudges(hub)] == ["@[bob", "@[amy"]
+
+
+async def test_no_nudge_when_a_copy_of_the_packet_carried_a_region(hub):
+    hub.nudge_settle_s = 0.05
+    plain, pl = grp_frame("bob: hi", real=True)
+    scoped, _ = grp_frame("bob: hi", real=True, region="#elsewhere")
+    await hub._on_raw_frame(plain, 6.0, -90)                 # a replayed or bridged plain copy
+    await hub._on_message(channel_msg("bob: hi", pl))
+    await hub._on_raw_frame(scoped, 6.0, -90)                # the sender's scoped original
+    await settle(hub)
+    assert not nudges(hub)
+
+
+async def test_no_nudge_when_the_frame_is_another_message(hub):
+    # Same key and text, different timestamp: the MAC checks out, the message does not.
+    raw, pl = grp_frame("bob: hi", real=True, ts=TS + 5)
+    await hub._on_raw_frame(raw, 6.0, -90)
+    await hub._on_message(channel_msg("bob: hi", pl))
+    await settle(hub)
+    assert not nudges(hub)
+
+
+async def test_nudge_on_a_slot_with_its_own_secret(hub):
+    secret = bytes.fromhex("00112233445566778899aabbccddeeff")
+    hub.slots[3] = {"name": "Club", "ok": True}
+    hub.channel_secrets[3] = secret
+    from openhop_openbot.mesh.frames import channel_hash_byte
+    hub.correlator.channel_hashes[3] = channel_hash_byte(secret)
+    hub.engine.cfg["nudges"].append({**hub.engine.cfg["nudges"][0], "channel": "Club"})
+    await say(hub, "bob: hi", idx=3, secret=secret)
+    assert [j.channel_idx for j in nudges(hub)] == [3]
+
+
+async def test_nudge_on_public_uses_its_well_known_key(hub):
+    import base64
+
+    from openhop_core.companion.constants import PUBLIC_GROUP_PSK
+    hub.engine.cfg["scope"]["protected_channels"] = []
+    hub.engine.cfg["nudges"].append({**hub.engine.cfg["nudges"][0], "channel": "Public"})
+    await say(hub, "bob: hi", idx=0, secret=base64.b64decode(PUBLIC_GROUP_PSK))
+    assert [j.channel_idx for j in nudges(hub)] == [0]
+
+
+async def test_a_channel_without_a_key_is_reported_once(hub):
+    hub.slots[4] = {"name": "Private", "ok": True}
+    hub.engine.cfg["nudges"].append({**hub.engine.cfg["nudges"][0], "channel": "Private"})
+    secret = bytes(range(16))
+    await say(hub, "bob: one", idx=4, secret=secret)
+    await say(hub, "amy: two", idx=4, secret=secret)
+    assert not nudges(hub)
+    assert [a["kind"] for a in hub.activity].count("error") == 1
+
+
+async def test_a_nudge_that_can_not_be_queued_does_not_count(hub):
+    from openhop_openbot.mesh.txqueue import MAX_DEPTH, TxJob
+    for _ in range(MAX_DEPTH):
+        hub.tx.put(TxJob(text="x", channel_idx=1))
+    await say(hub, "bob: hi")
+    assert not nudges(hub)
+    hub.tx._jobs.clear()
+    await say(hub, "bob: again", ts=TS + 1)
+    assert len(nudges(hub)) == 1
 
 
 async def test_nudge_skips_banned_senders_other_channels_and_the_bot(hub):
@@ -298,7 +436,7 @@ async def test_ban_test_and_unban_actions(hub):
 
 
 async def test_auto_ban_is_logged_in_activity(hub):
-    hub.engine.cfg["limits"]["user_cooldown_s"] = 30
+    hub.engine.cfg["limits"].update(user_max_requests=1, user_window_s=600)
     hub.engine.cfg["auto_ban"] = {"enabled": True, "strikes": 1, "window_s": 600, "ban_h": 2}
     await say(hub, "bob: !ping", region="#tx-dfw")
     await say(hub, "bob: !stats", region="#tx-dfw")
@@ -324,3 +462,31 @@ def test_defaults_ship_moderation_off_and_burst_on():
     assert out["limits"]["user_max_requests"] == 8 and out["limits"]["user_window_s"] == 600
     shipped = json.loads((Path(__file__).parent.parent / "config.default.json").read_text())
     assert "bans" in shipped and "nudges" in shipped and "auto_ban" in shipped
+
+
+# ---------------------------------------------------------------- store ----
+
+def test_traffic_rows_cover_hours_that_overlap_the_window():
+    _, store = make()
+    for ts in (3599, 3600, 7199, 7200, 10800):
+        store.count_traffic("#bot", "*", ts)
+    rows = store.traffic_rows(3600 + 1800, 10800)
+    assert [(r["ts"], r["count"]) for r in rows] == [(3600, 2), (7200, 1)]
+
+
+def test_prune_drops_old_moderation_rows():
+    from openhop_openbot.store import TRAFFIC_RETENTION_S
+    _, store = make()
+    now = 100_000_000
+    old = now - TRAFFIC_RETENTION_S - 7200           # whole hours are pruned
+    store.count_traffic("#bot", "*", old)
+    store.count_traffic("#bot", "*", now)
+    store.take_nudge("bot", "bob", 9, 9, 10, old)
+    store.take_hit("bob", 9, 10, now - 3 * 86400)
+    store.add_strike("bob", 10, now - 3 * 86400)
+    store.auto_ban("bob", now - 1, "x", now - 100)
+    store.prune(now)
+    assert len(store.traffic_rows(0, now + 3600)) == 1
+    assert not store.nudge_rows(0, now) and not store.auto_bans(now=0)
+    assert store.take_hit("bob", 1, 10 ** 9, now) is not None   # old hit gone
+    assert store.add_strike("bob", 10 ** 9, now) == 1            # old strike gone

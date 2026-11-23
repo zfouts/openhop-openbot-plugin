@@ -13,6 +13,7 @@ runs in a worker thread, and the companion reader only ever enqueues.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import copy
 import json
@@ -37,6 +38,7 @@ from .engine.usage import parse_window, skip_category, summarize, summarize_traf
 from .mesh.companion import Advert, CompanionClient, Message
 from .mesh.correlate import FrameCorrelator, region_of
 from .mesh.frames import (
+    PAYLOAD_TYPE_GRP_TXT,
     REGION_UNKNOWN,
     REGION_UNSCOPED,
     canonical_region,
@@ -63,6 +65,19 @@ RUNTIME_HEARTBEAT_S = 5.0
 CONTACTS_INTERVAL_S = 300
 ANNOUNCE_TICK_S = 15
 MAX_FOLLOW_UPS = 16
+# Wait this long before replying to an unscoped sender: copies of the same
+# packet keep arriving, and one that carries a region means the sender did
+# scope it (the plain copy came from a replay or a bridge). At most this many
+# wait at once.
+NUDGE_SETTLE_S = 8.0
+MAX_NUDGES_WAITING = 16
+SCOPED_SEEN_S = 120.0
+
+
+def _public_secret() -> bytes:
+    from openhop_core.companion.constants import PUBLIC_GROUP_PSK
+
+    return base64.b64decode(PUBLIC_GROUP_PSK)
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -132,6 +147,10 @@ class Hub:
         self._stop = asyncio.Event()
         self._ann_minute: Dict[str, str] = {}
         self._follow_ups: set = set()
+        self._nudges_waiting: set = set()
+        self.nudge_settle_s = NUDGE_SETTLE_S
+        self._scoped_seen: Dict[str, float] = {}   # packet hash -> when a scoped copy was heard
+        self._keyless_warned: set = set()
 
     # ------------------------------------------------------------ config ----
 
@@ -152,6 +171,11 @@ class Hub:
         except (OSError, ValueError) as exc:
             logger.error("config.json unreadable, keeping the last good config: %s", exc)
             self.problems = [f"config.json unreadable: {exc}"]
+            return False
+        except Exception as exc:
+            logger.error("config.json could not be validated, keeping the last good config: "
+                         "%s", exc, exc_info=True)
+            self.problems = [f"config.json could not be validated: {exc}"]
             return False
         for p in problems:
             logger.warning("config: %s", p)
@@ -243,7 +267,7 @@ class Hub:
         finally:
             self.tx.stop()
             await self.client.stop()
-            tasks += list(self._follow_ups)
+            tasks += list(self._follow_ups) + list(self._nudges_waiting)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -370,8 +394,16 @@ class Hub:
     async def _on_raw_frame(self, raw: bytes, snr: float, rssi: int) -> None:
         self.counters["rx_frames"] += 1
         self._last_rssi = rssi
+        frame = None
         with contextlib.suppress(Exception):
-            self.correlator.remember(raw, snr, rssi)
+            frame = self.correlator.remember(raw, snr, rssi)
+        if frame is not None and frame.type == PAYLOAD_TYPE_GRP_TXT \
+                and frame.hdr.get("transport_codes"):
+            now = time.monotonic()
+            self._scoped_seen[frame.hash] = now
+            if len(self._scoped_seen) > 512:
+                self._scoped_seen = {h: t for h, t in self._scoped_seen.items()
+                                     if now - t < SCOPED_SEEN_S}
         try:
             adv = decode_advert_frame(raw)
         except Exception:
@@ -493,6 +525,9 @@ class Hub:
         if name.startswith("#"):
             with contextlib.suppress(ValueError):
                 return hashtag_secret(name)
+        if idx == 0 and name.lower() in ("", "public"):
+            with contextlib.suppress(Exception):
+                return _public_secret()
         return None
 
     def _verify_unscoped(self, msg: Message, frame) -> bool:
@@ -506,6 +541,12 @@ class Hub:
             return False
         secret = self._secret_for(msg.channel_idx)
         if secret is None:
+            if msg.channel_idx not in self._keyless_warned:
+                self._keyless_warned.add(msg.channel_idx)
+                logger.warning("unscoped replies on slot %s need its key: list the channel "
+                               "under channels with its secret", msg.channel_idx)
+                self.log_activity("error", detail="unscoped replies on slot %s need the "
+                                  "channel's key; add it under Channel slots" % msg.channel_idx)
             return False
         plain = group_text_plain(secret, frame.hdr.get("payload") or b"")
         return plain is not None and plain[0] == msg.timestamp \
@@ -514,17 +555,36 @@ class Hub:
     async def _maybe_nudge(self, req: Request) -> None:
         if not req.unscoped_verified:
             return
+        if len(self._nudges_waiting) >= MAX_NUDGES_WAITING:
+            logger.info("unscoped reply to %s dropped: %d already waiting", req.sender,
+                        MAX_NUDGES_WAITING)
+            return
+        task = asyncio.ensure_future(self._nudge_later(req))
+        self._nudges_waiting.add(task)
+        task.add_done_callback(self._nudges_waiting.discard)
+
+    async def _nudge_later(self, req: Request) -> None:
+        """Reply to an unscoped sender once copies of the packet have settled,
+        unless a copy that carried a region was heard after all."""
+        if await self._sleep(self.nudge_settle_s):
+            return
+        if req.packet_hash and req.packet_hash in self._scoped_seen:
+            logger.info("no unscoped reply to %s: a copy of %s carried a region",
+                        req.sender, req.packet_hash)
+            return
         try:
-            rule, text = await asyncio.to_thread(self.engine.nudge, req)
+            rule, text, row = await asyncio.to_thread(self.engine.nudge, req)
         except Exception as exc:
-            logger.error("nudge failed: %s", exc, exc_info=True)
+            logger.error("unscoped reply failed: %s", exc, exc_info=True)
             return
         if rule is None:
             return
         text = clamp_bytes(text)
-        self.tx.put(TxJob(text=text, channel_idx=req.channel_idx,
-                          scope=self.scope_for(str(rule.get("region") or "")),
-                          label="nudge:%s" % req.channel))
+        if not self.tx.put(TxJob(text=text, channel_idx=req.channel_idx,
+                                 scope=self.scope_for(str(rule.get("region") or "")),
+                                 label="nudge:%s" % req.channel)):
+            self.store.drop_nudge(row)      # not sent, so it does not count
+            return
         self.log_activity("nudge", channel=req.channel, region=req.region,
                           sender=req.sender, text=text)
 
@@ -738,7 +798,8 @@ class Hub:
             name = str(args.get("name") or "").strip()
             if not name:
                 raise ValueError("give a name to test")
-            return {"name": name, "banned": self.engine.ban_reason(name)}
+            return {"name": name,
+                    "banned": await asyncio.to_thread(self.engine.ban_reason, name)}
         if action == "unban":
             sender = sender_key(args.get("sender"))
             if not sender:

@@ -305,10 +305,14 @@ On the **Moderation** tab. A request has to pass all three:
 | `commands[].cooldown_s` | per command | Seconds before the same sender can use that command again. |
 | `limits.user_max_requests` per `limits.user_window_s` | 8 per 600 | Answered commands per sender in any 10 minutes. `0` turns it off. |
 
-A sender is their name, ignoring case. All three follow the sender everywhere:
-asking again on another channel, in another region or by DM does not start a
-new cooldown. A skip entry in the activity list says which one stopped a
-request.
+On a channel a sender is their name, ignoring case; that is all a channel
+message carries. A DM sender is their public key, whatever name they use. All
+three follow a sender across channels and regions: asking again elsewhere
+does not start a new cooldown. A skip entry in the activity list says which
+one stopped a request.
+
+The cap is on by default from 1.4.0 (8 answered commands per 10 minutes).
+Set `limits.user_max_requests` to `0` to turn it off.
 
 ## Bans
 
@@ -334,8 +338,9 @@ Things to know:
 - Names are cut to 64 characters before matching, longer than any real node
   name. Avoid nested repeats such as `(a+)+`: a pattern like that can take a
   long time on a crafted name.
-- A pattern that does not compile is skipped and listed under configuration
-  problems on the Status tab.
+- A pattern that does not compile, or that matches an empty name and so
+  everyone (a stray `|` as in `spammer|`), is skipped and listed under
+  configuration problems on the Status tab.
 
 **Test a name** asks the running bot whether a name is banned and by which
 rule. It uses the saved bans, so save first.
@@ -343,9 +348,16 @@ rule. It uses the saved bans, so save first.
 ### Automatic bans
 
 With **Ban a sender who keeps hitting the limits** on (`auto_ban.enabled`,
-off by default), each request refused by a per-sender limit is a strike.
+off by default), each request refused by the per-sender cap is a strike.
 `auto_ban.strikes` strikes (default 5) within `auto_ban.window_s` seconds
 (default 600) ban that sender for `auto_ban.ban_h` hours (default 24).
+Cooldown refusals do not count: someone retrying over a weak link is not
+abusing the bot. It needs the cap on (`limits.user_max_requests` above 0).
+
+On a channel anyone can type anyone's name, so someone could get a name
+banned there by flooding the bot as it. DM senders are counted by key, so
+that never reaches the real owner's DMs. Lift a ban you think was caused
+that way.
 
 The bot sends nothing when it bans someone. The ban shows on the Moderation
 tab, with a **Lift** button, and as a `ban` entry in the activity list. It
@@ -389,11 +401,18 @@ there with no region:
 | `region` | empty | Where the reply is sent: empty for the companion default, `*` unscoped, or `#name`. Sending in a region keeps the reply itself from flooding the mesh. |
 | `text` | as above | A template: `{sender}`, `{channel}` and the other tokens work. Keep `@[{sender}]` so they see it. |
 
-The bot only replies when it can prove the message had no region: the packet
-it heard was a plain flood **and** decrypts, with the channel's key, to
-exactly that message. A message it cannot match is never answered. Banned
-senders, the bot itself, requests beyond `scope.max_hops` and protected
-channels (Public, by default) never get a reply.
+The bot replies only when the packet it heard was a plain flood **and**
+decrypts, with the channel's key, to exactly that message. It then waits a
+few seconds: if a copy of the same packet that carries a region turns up
+(the plain one may have come from a replay or a bridge), it stays quiet. A
+message it cannot match is never answered. Banned senders, the bot itself,
+requests beyond `scope.max_hops` and protected channels (Public, by default)
+never get a reply.
+
+It needs the channel's key: a slot listed under **Channel slots** (hashtag
+channels derive theirs; others need the secret), or Public. A channel without
+one is logged once as an error. `per_sender` counts replies to that sender on
+that channel.
 
 The test box on the Commands tab shows the reply when you test with region
 `*` on that channel. Each reply sent is a `nudge` entry in the activity list.
@@ -557,7 +576,7 @@ openHop keeps the field through later installs and updates, uploaded or not.
 | State `FAILED` or log shows `Companion connection lost ... retry` | Companion not listening. Check step 3, the port, and that nothing else (another plugin, a phone app) holds the companion. |
 | Bot never answers | Look at the activity list in the plugin page. A `skip` entry names the reason: `channel ... not in scope`, `region ... not in scope`, `protected channel`, `banned (...)`, `requester cooldown`, `command cooldown`, `requester rate limit`. |
 | Someone is ignored and you don't know why | Moderation tab: **Test a name**. A rule or an automatic ban is named; lift an automatic ban there. |
-| No unscoped replies | The channel needs an enabled entry under **Replies to unscoped senders**, and the sender must have sent a plain flood the bot could verify. Check the caps: one per sender per 24 h by default. |
+| No unscoped replies | The channel needs an enabled entry under **Replies to unscoped senders**, the bot needs the channel's key (an error entry says so), and the sender must have sent a plain flood the bot could verify. Check the caps: one per sender per 24 h by default. |
 | Usage shows a lot of "could not tell" | The radio delivered messages it could not match to a heard packet, such as ones queued while the bot was disconnected. |
 | Silent when you list regions | The request was `?` or unscoped. Add the region to the top-level `regions`, and add `*` to allow unscoped. |
 | Silent on Public | By design. |

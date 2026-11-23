@@ -248,15 +248,17 @@ function validate() {
     if (!String(a.channel || '').trim()) e.push(n + ': channel is required');
     if (!validSchedule(a.schedule)) e.push(n + ': schedule must be a 5-field cron expression or "every <seconds>"');
   });
-  const num = (v, lbl, min, max) => {
-    if (typeof v !== 'number' || !isFinite(v) || v < min || (max != null && v > max)) e.push(lbl + ' must be a number' + (max != null ? ' from ' + min + ' to ' + max : ' of ' + min + ' or more'));
+  const num = (v, lbl, min, max, whole) => {
+    if (typeof v !== 'number' || !isFinite(v) || v < min || (max != null && v > max) || (whole && !Number.isInteger(v))) e.push(lbl + ' must be a ' + (whole ? 'whole number' : 'number') + (max != null ? ' from ' + min + ' to ' + max : ' of ' + min + ' or more'));
   };
+  const opt = (v, ...a) => { if (v != null && v !== '') num(v, ...a); };  // missing = the bot's default
   num(c.companion.port, 'Companion port', 1, 65535);
   num(c.node.path_hash_bytes, 'path_hash_bytes', 1, 3);
   num(c.limits.tx_gap_s, 'tx_gap_s', 0); num(c.limits.tx_max_per_min, 'tx_max_per_min', 0); num(c.limits.user_cooldown_s, 'user_cooldown_s', 0);
-  num(c.limits.user_max_requests, 'Most answered commands per sender', 0, 1000); num(c.limits.user_window_s, 'Per-sender window', 10, 86400);
+  opt(c.limits.user_max_requests, 'Most answered commands per sender', 0, 1000, true); opt(c.limits.user_window_s, 'Per-sender window', 10, 86400);
   c.bans.forEach((b, i) => { if (!String(b.pattern || '')) e.push('Ban ' + (i + 1) + ': pattern is required (an empty one would match everyone)'); });
-  num(c.auto_ban.strikes, 'Refusals before an automatic ban', 1, 1000); num(c.auto_ban.window_s, 'Automatic ban window', 10, 86400); num(c.auto_ban.ban_h, 'Automatic ban length', 0.1, 8760);
+  opt(c.auto_ban.strikes, 'Refusals before an automatic ban', 1, 1000, true); opt(c.auto_ban.window_s, 'Automatic ban window', 10, 86400); opt(c.auto_ban.ban_h, 'Automatic ban length', 0.1, 8760);
+  if (c.auto_ban.enabled && c.limits.user_max_requests === 0) e.push('Automatic bans count refusals by the per-sender cap, which is off (0): set "Most answered commands per sender"');
   const prot = new Set(c.scope.protected_channels.map(chanNorm)), nch = new Set();
   c.nudges.forEach((x, i) => {
     const n = 'Unscoped reply ' + (i + 1) + (x.channel ? ' (' + x.channel + ')' : '');
@@ -265,10 +267,9 @@ function validate() {
     else if (prot.has(k)) e.push(n + ': ' + x.channel + ' is protected; the bot never sends there');
     else if (nch.has(k)) e.push(n + ': a channel can have only one');
     nch.add(k);
-    if (!String(x.text || '').trim()) e.push(n + ': text is required');
-    const r = String(x.region || '').trim();
-    if (r && r !== '*' && !r.startsWith('#')) e.push(n + ': region must be empty, * or a #name');
-    num(x.per_sender, n + ': per sender', 1, 100); num(x.per_channel, n + ': per channel', 1, 1000); num(x.window_h, n + ': hours', 0.1, 720);
+    if ('text' in x && !String(x.text || '').trim()) e.push(n + ': reply text is empty');
+    if (String(x.region || '').trim().startsWith('$')) e.push(n + ': region must be empty, * or a region name');
+    opt(x.per_sender, n + ': per sender', 1, 100, true); opt(x.per_channel, n + ': per channel', 1, 1000, true); opt(x.window_h, n + ': hours', 0.1, 720);
   });
   if ((c.corescope.enabled || c.corescope.base_url) && !/^https?:\/\/[^\/\s]+/.test(c.corescope.base_url || '')) e.push('CoreScope base URL must start with http:// or https://');
   if (c.corescope.shortener === 'custom' && !/^https:\/\/[^\/\s?#]+[^\s?#]*$/.test(c.corescope.shortener_url || '')) e.push('Custom shortener URL must be an https:// address');
@@ -683,7 +684,7 @@ const NUDGE_TEXT = '@[{sender}] your message had no region, so it flooded the wh
 const ABOUT_CMD = { id: 'about', enabled: true, trigger: '!about', description: 'What this bot is and the version it runs', reply: '{about}', channels: [], regions: [], dm: null, cooldown_s: 30 };
 function aliasField(m) {
   // Only write m.aliases once the operator adds one, so opening a card is not an edit.
-  const al = Array.isArray(m.aliases) ? m.aliases : [];
+  const al = Array.isArray(m.aliases) ? m.aliases : typeof m.aliases === 'string' ? m.aliases.split(',').map((x) => x.trim()).filter(Boolean) : [];
   return h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Aliases' }),
     chips(al, { aria: 'Add alias for ' + (m.id || 'command'), ph: '!p', onchange: () => { m.aliases = al; } }),
     h('small', { text: 'Other triggers for this command. They share its cooldown and usage; {help} lists only the trigger.' }));
@@ -859,12 +860,12 @@ function tabScope() {
       const [cnt, upd] = byteCounter(() => n.text);
       return h('div', { class: 'card stack' },
         h('div', { class: 'grid' },
-          h('div', {}, check('Enabled', n, 'enabled')),
+          h('div', {}, h('label', { class: 'chk' }, flagOn(n, 'enabled', 'Unscoped reply ' + (i + 1) + ': enabled'), h('span', { text: 'Enabled' }))),
           field('Channel', textIn(n, 'channel', { mono: true, list: 'dl-nch', ph: '#bot' })),
           field('Send in region', textIn(n, 'region', { mono: true, list: 'dl-nrg', ph: 'companion default' }), 'Empty = companion default, * = unscoped. A region keeps the reply itself from flooding the mesh.'),
-          field('At most, per sender', numIn(n, 'per_sender', { min: 1, max: 100, step: 1 })),
-          field('At most, for the channel', numIn(n, 'per_channel', { min: 1, max: 1000, step: 1 })),
-          field('In any (hours)', numIn(n, 'window_h', { min: 0.1, max: 720 }))),
+          field('At most, per sender', numIn(n, 'per_sender', { min: 1, max: 100, step: 1, ph: '1' }), 'On this channel.'),
+          field('At most, for the channel', numIn(n, 'per_channel', { min: 1, max: 1000, step: 1, ph: '6' })),
+          field('In any (hours)', numIn(n, 'window_h', { min: 0.1, max: 720, ph: '24' }))),
         h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Reply' }), textarea(n, 'text', { rows: 2, aria: 'Reply for ' + (n.channel || 'channel'), onchange: upd }),
           h('small', {}, cnt, ' {sender} and the other template tokens work here. Include @[{sender}] so they see it.')),
         h('div', { class: 'row' }, h('button', { type: 'button', class: 'sm danger', text: 'Remove', onclick: () => { cfg.nudges.splice(i, 1); changed(); renderNudges(); } })));
@@ -874,7 +875,7 @@ function tabScope() {
   const addNudge = h('button', { type: 'button', text: 'Add a channel', onclick: () => {
     const used = new Set(cfg.nudges.map((x) => chanNorm(x.channel)));
     const ch = openChannels().find((x) => !used.has(chanNorm(x))) || '';
-    cfg.nudges.push({ channel: ch, enabled: true, region: '', per_sender: 1, per_channel: 6, window_h: 24, text: NUDGE_TEXT });
+    cfg.nudges.push({ channel: ch, enabled: true, region: regionNames()[0] || '', per_sender: 1, per_channel: 6, window_h: 24, text: NUDGE_TEXT });
     changed(); renderNudges();
   } });
   return { el: h('div', {},
@@ -894,7 +895,7 @@ function tabScope() {
       check('Reply in the region the request arrived under', cfg.limits, 'reply_in_request_region')),
     h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Replies to unscoped senders' }), addNudge),
       h('p', { text: 'Off unless you turn it on for a channel. When the radio hears someone on that channel send a message with no region (a plain flood, which every repeater forwards across the whole mesh), the bot replies to suggest they set one.' }),
-      h('p', { class: 'hint', text: 'The bot only replies when it can prove the message had no region: the packet it heard was a plain flood and decrypts to exactly that message. Messages it cannot match are never answered. Banned senders and protected channels never get one. The Usage tab shows how much of each channel\'s traffic is unscoped.' }),
+      h('p', { class: 'hint', text: 'The bot replies only when the packet it heard was a plain flood that decrypts to exactly that message, and waits a few seconds first: if any copy of the packet turns out to carry a region, it stays quiet. Messages it cannot match are never answered. It needs the channel\'s key, so the channel must be a slot listed below (or Public). Banned senders and protected channels never get one. The Usage tab shows how much of each channel\'s traffic is unscoped.' }),
       nudgeList, datalist('dl-nch', openChannels()), datalist('dl-nrg', ['*', ...regionNames()])),
     h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Channel slots' }),
       h('button', { type: 'button', text: 'Add channel', onclick: () => { let n = 1; const used = new Set(cfg.channels.map((c) => c.idx)); while (used.has(n) && n < 40) n++; cfg.channels.push({ idx: n, name: '#' }); changed(); renderCh(); } }), prov),
@@ -944,7 +945,7 @@ function tabModeration() {
   const active = h('div');
   const refresh = () => {
     const bans = (rt && rt.auto_bans) || [];
-    active.replaceChildren(bans.length ? h('div', { class: 'tablewrap' }, h('table', {},
+    paint(active, rtState + JSON.stringify(bans), () => active.replaceChildren(bans.length ? h('div', { class: 'tablewrap' }, h('table', {},
       h('thead', {}, h('tr', {}, ['Sender', 'Since', 'Until', 'Why', ''].map((t) => h('th', { text: t })))),
       h('tbody', {}, bans.map((b) => {
         const lift = h('button', { type: 'button', class: 'sm', text: 'Lift', 'aria-label': 'Lift the ban on ' + b.sender, onclick: async () => {
@@ -956,7 +957,7 @@ function tabModeration() {
         return h('tr', {}, h('td', { class: 'mono', text: b.sender }), h('td', { text: ago(b.since) }),
           h('td', { text: new Date(b.until * 1000).toLocaleString() }), h('td', { class: 'muted', text: b.reason || '' }), h('td', {}, lift));
       }))))
-      : h('p', { class: 'muted', text: rtState === 'ok' ? 'Nobody is banned automatically right now.' : 'Shown once the bot is running.' }));
+      : h('p', { class: 'muted', text: rtState === 'ok' ? 'Nobody is banned automatically right now.' : 'Shown once the bot is running.' })));
   };
   refresh();
 
@@ -973,14 +974,14 @@ function tabModeration() {
         field('Gap between one sender\'s commands (s)', numIn(lim, 'user_cooldown_s', { min: 0 }), 'Across all commands.'),
         field('Most answered commands per sender', numIn(lim, 'user_max_requests', { min: 0, max: 1000, step: 1 }), '0 turns this off.'),
         field('In any (seconds)', numIn(lim, 'user_window_s', { min: 10, max: 86400 }), '600 = 10 minutes.')),
-      h('p', { class: 'hint', text: 'A command\'s own cooldown also follows the sender: asking again on another channel, in another region or by DM waits it out too.' })),
+      h('p', { class: 'hint', text: 'A command\'s own cooldown also follows the sender: asking again on another channel or in another region waits it out too. A channel sender is counted by name; a DM sender by their key.' })),
     h('div', { class: 'card stack' }, h('h2', { text: 'Automatic bans' }),
       check('Ban a sender who keeps hitting the limits', ab, 'enabled'),
       h('div', { class: 'grid' },
-        field('Refusals before a ban', numIn(ab, 'strikes', { min: 1, max: 1000, step: 1 }), 'Requests refused by the gap, a cooldown or the per-sender cap.'),
+        field('Refusals before a ban', numIn(ab, 'strikes', { min: 1, max: 1000, step: 1 }), 'Requests refused by the per-sender cap. Cooldowns do not count: that is what a retry looks like.'),
         field('Within (seconds)', numIn(ab, 'window_s', { min: 10, max: 86400 })),
         field('Ban for (hours)', numIn(ab, 'ban_h', { min: 0.1, max: 8760 }))),
-      h('p', { class: 'hint', text: 'The bot sends nothing when it bans someone; it shows here and in the activity log. Bans end on their own.' }),
+      h('p', { class: 'hint', text: 'Needs the per-sender cap above. The bot sends nothing when it bans someone; it shows here and in the activity log, and ends on its own. On a channel anyone can type anyone\'s name, so someone could get a name banned there by flooding as it. DMs are counted by key (dm:...), so that never reaches the real owner\'s DMs.' }),
       active)), refresh };
 }
 

@@ -464,9 +464,10 @@ class Store:
         return [_row(r) for r in rows]
 
     def take_nudge(self, channel: str, sender: str, per_sender: int, per_channel: int,
-                   window_s: float, now: Optional[float] = None) -> bool:
+                   window_s: float, now: Optional[float] = None) -> Optional[int]:
         """Record one nudge unless ``sender`` already had ``per_sender`` or the
-        channel ``per_channel`` in the last ``window_s``. Atomic."""
+        channel ``per_channel`` in the last ``window_s``. Returns the row id to
+        give back with ``drop_nudge``, or None when a cap is reached. Atomic."""
         now = time.time() if now is None else now
         since = now - window_s
         with self._lock:
@@ -477,10 +478,12 @@ class Store:
                 "SELECT count(*) FROM nudges WHERE channel = ? AND ts > ?",
                 (channel, since)).fetchone()
             if mine >= per_sender or all_ >= per_channel:
-                return False
-            self._db.execute("INSERT INTO nudges (ts, channel, sender) VALUES (?,?,?)",
-                             (now, channel, sender))
-            return True
+                return None
+            return self._db.execute("INSERT INTO nudges (ts, channel, sender) VALUES (?,?,?)",
+                                    (now, channel, sender)).lastrowid
+
+    def drop_nudge(self, row_id: int) -> None:
+        self._x("DELETE FROM nudges WHERE id = ?", (row_id,))
 
     def nudge_rows(self, since: float, until: float) -> List[Dict[str, Any]]:
         rows = self._q("SELECT ts, channel, sender FROM nudges WHERE ts >= ? AND ts < ?",

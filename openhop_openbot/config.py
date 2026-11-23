@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import re
 import site
@@ -199,8 +200,10 @@ def _number(obj: Dict[str, Any], key: str, default: float, lo: float, hi: float,
         obj[key] = default
         return default
     try:
+        if isinstance(v, bool):
+            raise ValueError
         n = float(v)
-        if integer and n != int(n):
+        if not math.isfinite(n) or (integer and n != int(n)):
             raise ValueError
     except (TypeError, ValueError):
         n = None
@@ -213,39 +216,44 @@ def _number(obj: Dict[str, Any], key: str, default: float, lo: float, hi: float,
 
 def _validate_moderation(cfg: Dict[str, Any], problems: List[str]) -> None:
     """bans, limits.user_max_requests / user_window_s, auto_ban and nudges."""
-    import re
-
     from .engine import moderation as mod
     from .engine.bot import chan_norm
 
+    def section(key: str, kind: type, what: str) -> Any:
+        v = cfg.get(key)
+        if v is None and kind is list:
+            return []                   # null is as good as an empty list
+        if not isinstance(v, kind):
+            problems.append(f"{key} must be {what}; ignored")
+            return kind()
+        return v
+
+    # Every entry keeps its place, usable or not, so "ban #3" is the third
+    # entry the operator wrote; compile_bans skips the unusable ones.
     bans = []
-    for i, b in enumerate(cfg.get("bans") or [], 1):
+    for i, b in enumerate(section("bans", list, "a list"), 1):
         if isinstance(b, str):
             b = {"pattern": b}
         if not isinstance(b, dict):
-            problems.append(f"ban #{i}: not an object")
+            problems.append(f"ban #{i}: not an object; skipped")
+            bans.append({"pattern": "", "enabled": False})
             continue
-        pattern = str(b.get("pattern") or "")
-        if not pattern:
-            problems.append(f"ban #{i}: empty pattern (it would match everyone); skipped")
-            continue
-        rule = {**b, "pattern": pattern, "ignore_case": b.get("ignore_case", True) is not False,
+        rule = {**b, "pattern": str(b.get("pattern") or ""),
+                "ignore_case": b.get("ignore_case", True) is not False,
                 "enabled": b.get("enabled", True) is not False}
-        try:
-            mod.compile_rule(rule)
-        except re.error as exc:
-            problems.append(f"ban #{i} {pattern!r}: {exc}; skipped")
-            continue
+        why = mod.rule_problem(rule)
+        if why is not None:
+            problems.append(f"ban #{i} {rule['pattern']!r}: {why}; skipped")
         bans.append(rule)
     cfg["bans"] = bans
 
-    limits = cfg.setdefault("limits", {})
+    limits = cfg["limits"] = dict(section("limits", dict, "an object"))
     _number(limits, "user_max_requests", mod.USER_MAX_REQUESTS, 0, 1000,
             "limits.user_max_requests", problems, integer=True)
     _number(limits, "user_window_s", mod.USER_WINDOW_S, *mod.WINDOW_S_RANGE,
             "limits.user_window_s", problems)
 
-    ab = {**mod.AUTO_BAN_DEFAULTS, **(cfg.get("auto_ban") or {})}
+    ab = {**mod.AUTO_BAN_DEFAULTS, **section("auto_ban", dict, "an object")}
     ab["enabled"] = ab.get("enabled") is True
     _number(ab, "strikes", mod.AUTO_BAN_DEFAULTS["strikes"], *mod.STRIKES_RANGE,
             "auto_ban.strikes", problems, integer=True)
@@ -254,11 +262,14 @@ def _validate_moderation(cfg: Dict[str, Any], problems: List[str]) -> None:
     _number(ab, "ban_h", mod.AUTO_BAN_DEFAULTS["ban_h"], *mod.BAN_H_RANGE,
             "auto_ban.ban_h", problems)
     cfg["auto_ban"] = ab
+    if ab["enabled"] and not limits.get("user_max_requests"):
+        problems.append("auto_ban counts refusals by the per-sender cap, which is off "
+                        "(limits.user_max_requests 0): nobody will be banned")
 
     protected = {chan_norm(c) for c in _str_list((cfg.get("scope") or {}).get(
         "protected_channels"))}
     nudges, seen = [], set()
-    for i, n in enumerate(cfg.get("nudges") or [], 1):
+    for i, n in enumerate(section("nudges", list, "a list"), 1):
         if not isinstance(n, dict):
             problems.append(f"nudge #{i}: not an object")
             continue
