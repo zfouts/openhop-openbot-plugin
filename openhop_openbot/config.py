@@ -183,6 +183,12 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         except ValueError as exc:
             problems.append(f"corescope.shortener_url: {exc}")
 
+    if isinstance(cfg.get("corescope"), dict) and \
+            not isinstance(cfg["corescope"].get("regions", True), bool):
+        problems.append("corescope.regions must be true or false (got %r); using true"
+                        % (cfg["corescope"]["regions"],))
+        cfg["corescope"]["regions"] = True
+
     from .engine.mpath import DEFAULT_WAIT_S, MAX_WAIT_S, MIN_WAIT_S, parse_wait
     w = cs.get("mpath_wait_s")
     if w not in (None, "") and parse_wait(w) is None:

@@ -23,7 +23,7 @@ const DEFAULTS = {
   bans: [], auto_ban: { enabled: false, strikes: 5, window_s: 600, ban_h: 24 }, nudges: [],
   commands: [], announcements: [],
   weather: { units: 'auto', default_country: 'us', contact: '' },
-  corescope: { enabled: false, base_url: '', shortener: 'v.gd', shortener_url: '', shortener_key: '', mpath_wait_s: 30 },
+  corescope: { enabled: false, base_url: '', regions: true, shortener: 'v.gd', shortener_url: '', shortener_key: '', mpath_wait_s: 30 },
   notify: { targets: [], events: { update: false, ignored: false, started: false, problems: false }, max_per_hour: 6 },
 };
 
@@ -672,9 +672,9 @@ function tabStatus() {
           kv([['Host', cfg.companion.host + ':' + cfg.companion.port], ['Uptime', rt && rt.started_at ? dur(Date.now() / 1000 - rt.started_at) : '-'], ['Last update', rt && rt.timestamp ? ago(rt.timestamp) : '-']])),
         h('div', { class: 'card' }, h('h3', { text: 'Node' }),
           kv([['Name', s.node_name], ['Pubkey', s.pubkey], ['Position', s.latitude != null && s.longitude != null ? s.latitude + ', ' + s.longitude : null], ['Radio', s.radio ? radioLabel(s.radio) : null]])),
-        h('div', { class: 'card' }, h('h3', { text: 'CoreScope links' }),
+        h('div', { class: 'card' }, h('h3', { text: 'CoreScope' }),
           h('p', {}, pill(cfg.corescope.enabled ? 'on' : 'off', cfg.corescope.enabled ? true : undefined)),
-          h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + shortenerLabel(cfg.corescope) + (hasMpath() ? ' · !mpath on' : '') : '!path replies with hop hashes only; !mpath is silent.' }))),
+          h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + shortenerLabel(cfg.corescope) + (hasMpath() ? ' · !mpath on' : '') + (cfg.corescope.regions !== false ? ' · region list on' : ' · region list off') : '!path replies with hop hashes only; !mpath is silent; no CoreScope region list.' }))),
       updBox,
       h('div', { class: 'card' }, h('h3', { text: 'Counters' }),
         h('div', { class: 'counters' }, Object.entries(c).map(([k, v]) => h('div', { class: 'counter' }, h('b', { text: String(v) }), h('span', { text: k }))))),
@@ -984,7 +984,7 @@ function tabScope() {
     const R = rt && rt.regions;
     const cs = (R && R.corescope) || {};
     const heard = new Map(((R && R.heard) || []).map((x) => [x.name, x]));
-    const csRows = new Map((cs.regions || []).map((x) => [x.name, x]));
+    const csRows = new Map((csListOn() ? cs.regions || [] : []).map((x) => [x.name, x]));
     const watching = new Set((R && R.watching) || []);
     const names = new Set(cfg.regions.map(regionKey));
     // An answered name with no region in use under any spelling gets its own row (it never matches).
@@ -1023,7 +1023,7 @@ function tabScope() {
   function drawRegions(force) {
     const R = rt && rt.regions;
     const cs = (R && R.corescope) || {};
-    const csOn = !!cfg.corescope.enabled;
+    const csOn = csListOn();
     const all = rows();
     const only = mode() === 'only';
     const f = scopeUI.filter.trim().toLowerCase();
@@ -1052,7 +1052,8 @@ function tabScope() {
     refreshBtn.disabled = !csOn || scopeUI.refreshing;
     refreshBtn.textContent = scopeUI.refreshing ? 'Refreshing…' : 'Refresh from CoreScope';
     let status;
-    if (!csOn) status = [h('span', { text: 'CoreScope is off, so only regions you add are listed. ' }), h('button', { type: 'button', class: 'link', text: 'Set up CoreScope', onclick: () => go('corescope') })];
+    if (!cfg.corescope.enabled) status = [h('span', { text: 'CoreScope is off, so only regions you add are listed. ' }), h('button', { type: 'button', class: 'link', text: 'Set up CoreScope', onclick: () => go('corescope') })];
+    else if (!csOn) status = [h('span', { text: 'CoreScope\'s region list is off, so only regions you add are listed. ' }), h('button', { type: 'button', class: 'link', text: 'Turn it on', onclick: () => go('corescope') })];
     else if (!R) status = h('span', { class: 'muted', text: rtState === 'ok' ? 'This version of the bot does not report regions yet. Save, and let it restart or update.' : 'Waiting for the bot to report.' });
     else if (cs.error) status = h('span', { class: 'notice' }, h('b', { text: 'Last refresh failed' + (cs.error_at ? ' ' + ago(cs.error_at) : '') + ': ' }), String(cs.error).replace(/[.\s]*$/, '.') + (cs.fetched_at ? ' Showing the list from ' + ago(cs.fetched_at) + '.' : ''));
     else if (!cs.fetched_at) status = h('span', { class: 'muted', text: 'Not fetched from CoreScope yet. The bot fetches the list on start and every 6 hours.' });
@@ -1080,7 +1081,7 @@ function tabScope() {
 
     let table = null;
     const empty = !all.length ? h('div', { class: 'empty' }, h('p', {}, h('b', { text: 'No regions yet.' })),
-      h('p', { class: 'muted', text: csOn ? 'Refresh from CoreScope to list the regions it knows, or add one below.' : 'Add the regions your mesh uses below, or turn on CoreScope to list the ones it knows.' })) : null;
+      h('p', { class: 'muted', text: csOn ? 'Refresh from CoreScope to list the regions it knows, or add one below.' : 'Add the regions your mesh uses below, or turn on CoreScope\'s region list to see the ones it knows.' })) : null;
     if (!body.length) {
       if (all.length) table = h('p', { class: 'muted pad-s', text: 'No region matches "' + scopeUI.filter + '".' });
     } else {
@@ -1168,7 +1169,7 @@ function tabScope() {
     h('div', { class: 'card stack' },
       h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Regions' }), refreshBtn),
       statusBox,
-      h('p', { class: 'hint', text: 'Tick Use for each region the bot should recognise. The bot also listens for the regions CoreScope lists, so you can see one is live before you use it.' }),
+      h('p', { class: 'hint', text: 'Tick Use for each region the bot should recognise.' + (csListOn() ? ' The bot also listens for the regions CoreScope lists, so you can see one is live before you use it.' : '') }),
       regionsBox,
       h('div', { class: 'rg-add' },
         h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Add a region' }), h('div', { class: 'row' }, addIn, h('button', { type: 'button', text: 'Add', onclick: addRegion }))),
@@ -1741,6 +1742,8 @@ function shortenerLabel(cs) {
   try { return new URL(cs.shortener_url).host; } catch (_) { return 'custom shortener'; }
 }
 const MPATH_CMD = { id: 'mpath', enabled: true, trigger: '!mpath', description: 'Every route your message took to CoreScope\'s observers (needs CoreScope)', reply: '{mpath}', channels: [], regions: [], dm: null, cooldown_s: 30 };
+/* CoreScope's region list feeds the Scope & Regions tab: on with CoreScope unless switched off. */
+function csListOn() { return !!cfg.corescope.enabled && cfg.corescope.regions !== false; }
 function hasMpath() { return cfg.commands.some((m) => m.enabled !== false && /\{mpath\b/.test(m.reply || '')); }
 function tabCoreScope() {
   const cs = cfg.corescope;
@@ -1764,21 +1767,32 @@ function tabCoreScope() {
     field('Shortener key', textIn(cs, 'shortener_key', { mono: true, type: 'password', ph: 'optional' }), 'Sent as the key parameter. Leave empty if your service needs none.'));
   const showCustom = () => { custom.hidden = cs.shortener !== 'custom'; };
   showCustom();
+  const offNote = h('p', { class: 'hint', hidden: !!cs.enabled, text: 'Needs Use CoreScope on, with a base URL, at the top of this tab.' });
+  const showOff = () => { offNote.hidden = !!cs.enabled; };
   return { el: h('div', {},
-    h('div', { class: 'card stack' }, h('h2', { text: 'CoreScope map links' }),
+    h('div', { class: 'card stack' }, h('h2', { text: 'CoreScope' }),
+      h('p', { text: 'CoreScope is a MeshCore analyzer: observers around the mesh send it the packets they hear. With it on, the bot links !path replies to CoreScope\'s map, answers !mpath, and lists the regions CoreScope knows on the Scope & Regions tab.' }),
+      check('Use CoreScope', cs, 'enabled', { onchange: showOff }),
+      h('div', { class: 'grid' },
+        field('CoreScope base URL', textIn(cs, 'base_url', { mono: true, ph: 'https://analyzer.example.net' }), 'The address you open CoreScope at, without /api.'))),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Map links in !path' }),
       h('p', { text: '!path answers with the hop count and the hop hashes in travel order. With CoreScope on, it adds a short link to that route on CoreScope\'s map: "@[bob] [3h] 03b9,4216,d924 https://v.gd/AbC123". The map opens the packet by its hash, so it draws the route when CoreScope\'s observers heard the same packet.' }),
       h('p', { class: 'hint', text: 'The shortener gets the full map link (the packet hash and hop hashes); nothing else leaves the node. If shortening fails, !path uses the full link when it fits in one message, otherwise just the hashes. The {pathnames} template token still resolves hops to names and distance, using CoreScope\'s node list when this is on (that sends only the hop hashes to CoreScope).' }),
-      check('Use CoreScope (map links in !path, and !mpath)', cs, 'enabled'),
       h('div', { class: 'grid' },
-        field('CoreScope base URL', textIn(cs, 'base_url', { mono: true, ph: 'https://analyzer.example.net' }), 'The address you open CoreScope at, without /api.'),
         field('Link shortener', sel(cs, 'shortener', SHORTENERS, { onchange: showCustom }), '"Custom" is your own v.gd-compatible service. "None" sends the full link, which only fits short paths.')),
       custom),
     h('div', { class: 'card stack' }, h('h2', { text: '!mpath' }),
       h('p', { text: '!mpath shows every route a message took, as CoreScope\'s observers heard it. The bot answers at once ("@[bob] asking CoreScope\'s observers, back in 30s"), waits for the flood to finish, then asks CoreScope for every copy of that packet and replies: "@[bob] 9 routes to 6 observers, 1-5 hops, 2 direct https://v.gd/AbC123". The link opens CoreScope\'s page for the packet, which lists each observer and the path its copy took.' }),
-      h('p', { class: 'hint', text: 'Needs CoreScope on with a base URL. Without it, !mpath stays silent and !help leaves it out. A route is one observer and one distinct hop chain. Only the packet hash is sent to CoreScope; the shortener gets the packet link.' }),
+      h('p', { class: 'hint', text: 'Without CoreScope, !mpath stays silent and !help leaves it out. A route is one observer and one distinct hop chain. Only the packet hash is sent to CoreScope; the shortener gets the packet link.' }),
       h('div', { class: 'grid' },
         field('Wait before answering (seconds)', numIn(cs, 'mpath_wait_s', { min: 5, max: 300, step: 1 }), '5 to 300. Copies keep reaching observers for tens of seconds after the first; 30 catches most of them.')),
-      h('div', { class: 'row' }, addMpath, mpathNote))) };
+      h('div', { class: 'row' }, addMpath, mpathNote)),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Region list' }),
+      h('p', { text: 'Lists the regions CoreScope knows on the Scope & Regions tab, with the packets its observers matched to each over 7 days and how many repeaters say they carry it. The bot also listens on air for the 64 busiest, so you can see a region is live here before you use it.' }),
+      h('p', { class: 'hint', text: 'The bot fetches the list when it starts and every 6 hours, from CoreScope\'s scope statistics; nothing about this node is sent. Turned off, the Scope & Regions tab lists only the regions you add, and the bot listens only for those.' }),
+      offNote,
+      check('List CoreScope\'s regions on the Scope & Regions tab', cs, 'regions'),
+      h('div', { class: 'row' }, h('button', { type: 'button', class: 'link', text: 'Open Scope & Regions', onclick: () => go('scope') })))) };
 }
 
 // ---------------------------------------------------------------- tab: advanced

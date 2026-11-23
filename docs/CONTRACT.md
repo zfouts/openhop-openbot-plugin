@@ -223,7 +223,7 @@ ones are dropped. Events:
 ### CoreScope
 
 ```json
-"corescope": {"enabled": false, "base_url": "", "shortener": "v.gd",
+"corescope": {"enabled": false, "base_url": "", "regions": true, "shortener": "v.gd",
               "shortener_url": "", "shortener_key": "", "mpath_wait_s": 30}
 ```
 
@@ -245,6 +245,12 @@ roster for that lookup. `corescope.base_url` must be `http://` or `https://`;
 an invalid one logs `corescope disabled: ...` (no links, local roster only).
 Any CoreScope failure (5 s timeout, non-200, malformed body, over 1 MB)
 falls back to the local roster alone.
+
+`corescope.regions` (default `true`; a non-boolean is reported in
+`config_problems` and `true` is used) controls only the region list for the
+Scope & Regions tab: the 6-hourly fetch, the `corescope_regions` action and
+listening for CoreScope's regions on air. Map links, `{pathnames}` and
+`{mpath}` follow `corescope.enabled` alone.
 
 `{mpath}` renders empty without CoreScope (and `{help}` then leaves out any
 command whose reply uses it). With CoreScope it renders an acknowledgement
@@ -285,7 +291,7 @@ result.
 | `unban` | `sender` | `{"sender": "bob", "lifted": bool}`: lifts an automatic ban and clears that sender's strikes. |
 | `provision_channels` | | `{"channels": [...]}` |
 | `notify_test` | | `{"sent": n, "failed": ["zach: not a contact ..."]}`. A test message to every target, whatever the event switches; error when nothing could be sent. |
-| `corescope_regions` | | `{"regions": n, "partial": null \| "why"}`. Fetches CoreScope's region list now (`/api/scope-stats?window=7d` and `/api/scope-audit?window=1h`) and caches it in `data/corescope_regions.json`. Error when CoreScope is off or the stats fetch fails; `partial` is set when only the repeater counts failed. The bot also fetches on start and every 6 hours. |
+| `corescope_regions` | | `{"regions": n, "partial": null \| "why"}`. Fetches CoreScope's region list now (`/api/scope-stats?window=7d` and `/api/scope-audit?window=1h`) and caches it in `data/corescope_regions.json`. Error when CoreScope or its region list (`corescope.regions`) is off, or the stats fetch fails; `partial` is set when only the repeater counts failed. The bot also fetches on start and every 6 hours. |
 | `usage` | `{"range": "24h"\|"7d"\|"30d"\|"90d"\|"1y"}` or `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` | The usage report below. Dates are in `node.timezone`. |
 | `advert` | `{"flood": true\|false}` (default `true`) | `{"sent": bool, "flood": bool}`. Error if the companion is not connected. |
 
@@ -399,8 +405,9 @@ comes back as the action's error.
 the last `window_days` UTC days, `last_heard` the latest packet at all.
 `verified` is `packets >= 3` and a Poisson tail below 1e-6, with
 `scoped_packets / 65536` expected chance matches. `watching` is every region
-the bot tests packets against. `corescope.regions` is empty when CoreScope is
-off or the cached list came from another base URL.
+the bot tests packets against. `corescope.regions` is empty, and `corescope.enabled`
+false, when CoreScope or its region list (config `corescope.regions`) is off;
+the list is also empty when the cached one came from another base URL.
 
 `activity.kind` is one of `rx`, `reply`, `skip`, `nudge` (an unscoped
 reply), `ban` (an automatic ban began or was lifted), `notify` (an operator

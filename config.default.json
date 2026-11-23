@@ -180,6 +180,7 @@
   "corescope": {
     "enabled": false,
     "base_url": "",
+    "regions": true,
     "shortener": "v.gd",
     "shortener_url": "",
     "shortener_key": "",

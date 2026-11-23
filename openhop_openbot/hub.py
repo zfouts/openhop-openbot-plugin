@@ -289,9 +289,10 @@ class Hub:
             self.engine.shortener = None
             logger.error("no link shortener: %s", exc)
         if self.engine.corescope is not None:
-            logger.info("CoreScope at %s: !path map links and !mpath (shortener: %s)",
-                        self.engine.corescope.base,
-                        self.engine.shortener.label if self.engine.shortener else "none")
+            logger.info("CoreScope at %s: !path map links and !mpath (shortener: %s), "
+                        "region list %s", self.engine.corescope.base,
+                        self.engine.shortener.label if self.engine.shortener else "none",
+                        "off" if cs.get("regions") is False else "on")
         self._apply_cs_regions()
 
     @staticmethod
@@ -354,8 +355,15 @@ class Hub:
             return {}
         return self.cs_regions
 
+    def _cs_list_client(self) -> Any:
+        """The CoreScope client while its region list is on (``corescope.regions``,
+        on by default); else None. Map links and !mpath do not depend on it."""
+        if (self.cfg.get("corescope") or {}).get("regions") is False:
+            return None
+        return self.engine.corescope
+
     def _apply_cs_regions(self) -> None:
-        cache = self._cs_regions_for(self.engine.corescope)
+        cache = self._cs_regions_for(self._cs_list_client())
         self.regionwatch.set_candidates(r["name"] for r in cache.get("regions") or [])
 
     def _cs_regions_due(self, cs: Any, now: Optional[float] = None) -> bool:
@@ -376,9 +384,12 @@ class Hub:
         fetch's outcome rather than asking CoreScope again. Raises ValueError
         when CoreScope is off or the fetch fails; a failure keeps the last
         list and records why."""
-        cs = self.engine.corescope
-        if cs is None:
+        if self.engine.corescope is None:
             raise ValueError("CoreScope is off. Turn it on, with a base URL, on the "
+                             "CoreScope tab.")
+        cs = self._cs_list_client()
+        if cs is None:
+            raise ValueError("CoreScope's region list is off. Turn it on on the "
                              "CoreScope tab.")
         seq = self._cs_seq
         async with self._cs_lock:
@@ -428,7 +439,7 @@ class Hub:
 
     async def _corescope_loop(self) -> None:
         while not self._stop.is_set():
-            if self.engine.corescope is not None:
+            if self._cs_list_client() is not None:
                 try:
                     await self.refresh_corescope_regions(force=False)
                 except ValueError:
@@ -439,7 +450,7 @@ class Hub:
                 return
 
     def _regions_runtime(self) -> Dict[str, Any]:
-        cs = self.engine.corescope
+        cs = self._cs_list_client()
         cache = self._cs_regions_for(cs)
         return {**self.regionwatch.summary(),
                 "corescope": {"enabled": cs is not None,
