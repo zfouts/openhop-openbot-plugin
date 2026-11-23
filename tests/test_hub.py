@@ -178,9 +178,9 @@ def test_corescope_rebuilt_when_its_config_changes(tmp_path):
 
 def test_corescope_ships_disabled():
     from openhop_openbot.config import defaults
-    assert defaults()["corescope"] == {"enabled": False, "base_url": "", "shortener": "v.gd",
-                                      "shortener_url": "", "shortener_key": "",
-                                      "mpath_wait_s": 30}
+    assert defaults()["corescope"] == {"enabled": False, "base_url": "", "regions": True,
+                                      "shortener": "v.gd", "shortener_url": "",
+                                      "shortener_key": "", "mpath_wait_s": 30}
 
 
 def test_unknown_config_sections_are_ignored(tmp_path):

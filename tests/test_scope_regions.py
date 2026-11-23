@@ -125,6 +125,57 @@ async def test_corescope_off_means_no_candidates_and_no_refresh(tmp_path):
     assert rg["watching"] == ["#tx-dfw"]
 
 
+async def test_the_region_list_has_its_own_switch(tmp_path):
+    """corescope.regions off: no fetch, no candidates, none in runtime; map links
+    and !mpath keep their client. Back on, the cached list returns unfetched."""
+    h = make_hub(tmp_path)
+    h.engine.corescope = FakeCoreScope(regions=ROWS)
+    await h.execute("corescope_regions", {})
+    assert set(h.regionwatch.candidates) == {"#tx-fw"}
+
+    def write(regions):
+        (tmp_path / "config.json").write_text(json.dumps(
+            {"regions": ["#tx-dfw"],
+             "corescope": {"enabled": True, "base_url": CS_URL, "regions": regions}}))
+        assert h._reload_config()
+
+    write(False)
+    assert h.engine.corescope is not None and h.regionwatch.candidates == {}
+    with pytest.raises(ValueError, match="region list is off"):
+        await h.execute("corescope_regions", {})
+    cs = runtime(h, tmp_path)["corescope"]
+    assert cs["enabled"] is False and cs["regions"] == []
+    assert h._cs_list_client() is None
+
+    write(True)
+    assert set(h.regionwatch.candidates) == {"#tx-fw"}
+    assert runtime(h, tmp_path)["corescope"]["regions"] == ROWS
+
+
+async def test_the_refresh_loop_leaves_corescope_alone_while_the_list_is_off(
+        tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"corescope": {"enabled": True, "base_url": CS_URL, "regions": False}}))
+    h = Hub(tmp_path / "config.json", tmp_path)
+    h.engine.corescope = FakeCoreScope(regions=ROWS)
+    ticks = []
+
+    async def sleep(_):
+        ticks.append(1)
+        return len(ticks) >= 2
+
+    monkeypatch.setattr(h, "_sleep", sleep)
+    await h._corescope_loop()
+    assert h.engine.corescope.calls == 0
+
+
+def test_a_region_switch_that_is_not_a_boolean_is_reported():
+    from openhop_openbot.config import validate
+    cfg, problems = validate({"corescope": {"enabled": True, "regions": "no"}})
+    assert cfg["corescope"]["regions"] is True
+    assert any("corescope.regions" in p for p in problems)
+
+
 async def test_ticking_a_region_moves_it_from_candidates_to_enabled(tmp_path):
     h = make_hub(tmp_path)
     h.engine.corescope = FakeCoreScope(regions=ROWS)

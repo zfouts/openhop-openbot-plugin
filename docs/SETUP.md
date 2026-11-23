@@ -193,7 +193,8 @@ matched to the region, and how many repeaters say they carry it. The bot
 fetches the list on start and every 6 hours (15 minutes after a failure), and
 **Refresh from CoreScope** fetches it now. The last list is kept in
 `data/corescope_regions.json`, so it survives restarts; a list from a
-different CoreScope address is not used.
+different CoreScope address is not used. The column is hidden, and nothing is
+fetched, while CoreScope or its region list (`corescope.regions`) is off.
 
 ## `!path`
 
@@ -525,9 +526,8 @@ use.
 ## CoreScope map links (optional)
 
 If you run or use a [CoreScope](https://github.com/Kpa-clawbot/CoreScope)
-instance (a MeshCore analyzer), tick **Use CoreScope (map links in !path,
-and !mpath)** on the CoreScope tab (`corescope.enabled`), enter its address
-and pick a link shortener. This also turns on [`!mpath`](#mpath). `!path`
+instance (a MeshCore analyzer), tick **Use CoreScope** on the CoreScope tab
+(`corescope.enabled`), enter its address and pick a link shortener. This also turns on [`!mpath`](#mpath). `!path`
 then links to the route on CoreScope's map:
 
 ```
@@ -550,8 +550,12 @@ The link is shortened before it goes on the air:
 | `custom` | Your own shortener running the same software as v.gd and is.gd. Set its address and, if it needs one, its key. |
 | `none` | No shortener: the full link, used only when it fits beside the hashes (short paths). |
 
-With CoreScope on, the Scope & Regions tab also lists the regions it knows.
-See [The Regions table](#the-regions-table).
+With CoreScope on, the Scope & Regions tab also lists the regions it knows
+(see [The Regions table](#the-regions-table)). That list has its own switch,
+**List CoreScope's regions on the Scope & Regions tab** (`corescope.regions`,
+on by default), in the Region list card; turn it off to keep map links and
+`!mpath` without the bot fetching CoreScope's region list or listening for
+its regions.
 
 Each link is shortened once per run. If the shortener fails or is
 rate-limited, `!path` uses the full link if it fits beside every hash, and
@@ -575,6 +579,7 @@ one) are accepted. The key is never written to the log.
 |---|---|---|
 | `corescope.enabled` | `false` | The tick. |
 | `corescope.base_url` | empty | The address you open CoreScope at, without `/api`, for example `https://analyzer.example.net` or `http://10.0.0.5:3000`. http and https both work. |
+| `corescope.regions` | `true` | List CoreScope's regions on the Scope & Regions tab, and listen for the 64 busiest. Only applies while CoreScope is on. |
 | `corescope.shortener` | `v.gd` | One of the services above. |
 | `corescope.shortener_url` | empty | For `custom`: the shortener's https address, for example `https://short.example.org`. |
 | `corescope.shortener_key` | empty | For `custom`: sent as the `key` parameter. Leave empty if your shortener needs none. |
