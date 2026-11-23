@@ -37,13 +37,6 @@ from .templates import MAX_TEXT_BYTES, clamp_bytes
 
 log = logging.getLogger("openbot.builtins")
 
-# The CLI command is the part that has to survive
-# the frame limit, so a long sender name costs the prose, not the fix.
-HASH_HINT_COOLDOWN_S = 900
-HASH_HINT = ("1-byte path hashes leave hops ambiguous. Please enable 2-byte"
-             " (Settings > Default Path Hash Size) or CLI: set path.hash.mode 1")
-HASH_HINT_SHORT = "please enable 2-byte path hashes. CLI: set path.hash.mode 1"
-
 EIGHTBALL = ["it is certain", "without a doubt", "most likely", "outlook good",
              "ask again later", "cannot predict now", "don't count on it",
              "very doubtful", "my sources say no", "signs point to yes"]
@@ -94,11 +87,6 @@ def _now_local(ctx: Dict[str, Any]) -> datetime:
         return datetime.utcnow()
 
 
-def hash_hint(sender: str) -> str:
-    full = "@[%s] %s" % (sender, HASH_HINT)
-    return full if fits(full) else clamp_bytes("@[%s] %s" % (sender, HASH_HINT_SHORT))
-
-
 # ----------------------------------------------------------------- path ----
 
 def _hop_label(hop: Dict[str, Any], width: int) -> str:
@@ -115,8 +103,7 @@ def _path_start(ctx: Dict[str, Any]):
     """The shared start of {path} and {pathnames}.
 
     Returns (sender, hops_n, hops, reply). A reply that is not None answers
-    the request outright: no path info, heard direct, or hashes unavailable.
-    Otherwise queues the 1-byte-hash hint when it applies."""
+    the request outright: no path info, heard direct, or hashes unavailable."""
     sender = ctx.get("sender") or "?"
     hops_n = ctx.get("hops_n")
     hops = [str(h).lower() for h in ctx.get("hops") or []]
@@ -129,9 +116,6 @@ def _path_start(ctx: Dict[str, Any]):
     if not hops:
         return sender, hops_n, hops, "@[%s] [%dh] hop hashes unavailable for that copy" % (
             sender, hops_n)
-    if ctx.get("hash_size") == 1 and ctx.get("extra") is not None:
-        if ctx["store"].claim("_hint1b", sender, HASH_HINT_COOLDOWN_S):
-            ctx["extra"].append(hash_hint(sender))
     return sender, hops_n, hops, None
 
 

@@ -192,10 +192,6 @@ It resolves against this node's roster (plus CoreScope's nodes, when
 configured), and distances need positions: set `node.latitude`/`longitude`
 (or advertise a position on the companion).
 
-When a request used 1-byte path hashes, the bot also sends a second message
-asking the user to enable 2-byte hashes (at most once per 15 minutes per
-sender). Short hashes make hops ambiguous.
-
 ## `!mpath`
 
 `!path` shows the one route that reached this node. `!mpath` shows every route
