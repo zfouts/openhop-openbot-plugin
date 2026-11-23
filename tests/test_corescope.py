@@ -210,3 +210,102 @@ def test_direct_request_never_calls_corescope():
     cs, get = remote()
     out = fn_pathnames(ctx(cs, hops_n=0, hops=[]), None)
     assert "direct" in out and not get.calls
+
+
+# ----------------------------------------------------------------- regions --
+#
+# /api/scope-stats?window=7d: packets CoreScope's observers matched to each
+# region they hold a key for. /api/scope-audit?window=1h: each repeater's
+# declared region list (the window only scopes forwarding counts).
+
+class RouteGet:
+    """Answers by URL path: path -> (status, data), or an exception to raise."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def __call__(self, url, headers, timeout):
+        self.calls.append((url, timeout))
+        for prefix, answer in self.routes.items():
+            if prefix in url:
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        return 404, {"error": "not found"}
+
+
+def stats(*rows):
+    return 200, {"window": "7d", "summary": {"scoped": 9}, "timeSeries": [],
+                 "byRegion": [{"name": n, "count": c} for n, c in rows]}
+
+
+def audit(*declared):
+    return 200, {"window": "1h", "repeaters": [
+        {"publicKey": "%064x" % i, "declaredRegions": regs, "declaredWildcard": True}
+        for i, regs in enumerate(declared)]}
+
+
+def test_regions_merge_traffic_and_declarations():
+    get = RouteGet({"/api/scope-stats": stats(("#tx-dfw", 1203), ("#tx-fw", 88)),
+                    "/api/scope-audit": audit(["tx-dfw", "tx-austin"], ["#tx-dfw"], [])})
+    out = CoreScope("https://cs.example", get=get).regions()
+    assert [c[0] for c in get.calls] == ["https://cs.example/api/scope-stats?window=7d",
+                                         "https://cs.example/api/scope-audit?window=1h"]
+    assert out == {"partial": None, "regions": [
+        {"name": "#tx-dfw", "packets": 1203, "repeaters": 2},
+        {"name": "#tx-fw", "packets": 88, "repeaters": 0},
+        {"name": "#tx-austin", "packets": 0, "repeaters": 1},
+    ]}
+
+
+def test_regions_keep_case_and_drop_names_that_cannot_be_regions():
+    get = RouteGet({
+        "/api/scope-stats": stats(("#TX-DFW", 5), ("*", 9), ("#a b", 1), ("#x,y", 1),
+                                  ("#" + "z" * 33, 1), ("$priv", 1), ("#é", 1), ("", 3),
+                                  ("##dup", 1)),
+        "/api/scope-audit": audit(["#*", None, 7, "ok-okc", "ok-okc"])})
+    names = [r["name"] for r in CoreScope("https://cs.example", get=get).regions()["regions"]]
+    # #TX-DFW and #tx-dfw are different keys on air, so case is kept.
+    assert names == ["#TX-DFW", "#ok-okc"]
+
+
+def test_regions_tolerate_malformed_rows():
+    get = RouteGet({"/api/scope-stats": (200, {"byRegion": [
+        "x", {"name": "#a"}, {"name": "#b", "count": "9"}, {"name": "#c", "count": True},
+        {"name": "#d", "count": -4}, {"name": "#e", "count": 3}]}),
+        "/api/scope-audit": (200, {"repeaters": ["x", {"declaredRegions": "a,b"}, {}]})})
+    out = CoreScope("https://cs.example", get=get).regions()["regions"]
+    assert {r["name"]: r["packets"] for r in out} == {"#a": 0, "#b": 0, "#c": 0, "#d": 0, "#e": 3}
+
+
+def test_regions_without_declarations_are_partial():
+    get = RouteGet({"/api/scope-stats": stats(("#tx-dfw", 4)),
+                    "/api/scope-audit": OSError("timed out")})
+    out = CoreScope("https://cs.example", get=get).regions()
+    assert out["regions"] == [{"name": "#tx-dfw", "packets": 4, "repeaters": 0}]
+    assert "timed out" in out["partial"]
+
+
+@pytest.mark.parametrize("answer", [
+    (500, {"error": "scope_name column not present"}),
+    (404, None),
+    (200, {"byRegion": "nope"}),
+    OSError("connection refused"),
+])
+def test_regions_fail_without_traffic_stats(answer):
+    get = RouteGet({"/api/scope-stats": answer, "/api/scope-audit": audit(["a"])})
+    with pytest.raises(CoreScopeError):
+        CoreScope("https://cs.example", get=get).regions()
+
+
+def test_regions_are_capped():
+    rows = [("#r%d" % i, 1000 - i) for i in range(400)]
+    get = RouteGet({"/api/scope-stats": stats(*rows), "/api/scope-audit": audit()})
+    out = CoreScope("https://cs.example", get=get).regions()["regions"]
+    assert len(out) == 200 and out[0]["name"] == "#r0"
+
+
+def test_regions_audit_gets_a_longer_timeout():
+    get = RouteGet({"/api/scope-stats": stats(), "/api/scope-audit": audit()})
+    CoreScope("https://cs.example", get=get).regions()
+    assert get.calls[0][1] <= 5 < get.calls[1][1] <= 20

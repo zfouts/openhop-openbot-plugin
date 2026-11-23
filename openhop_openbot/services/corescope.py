@@ -23,6 +23,18 @@ the hop chain that copy carried:
                               "path_json": "[\\"9370\\",\\"BD7D\\"]", "direction"}, ...]}
     -> 404 when no observer heard it
 
+For the Scope tab's region list it reads two views of MeshCore regions
+(transport-code scopes, ``#name``). Neither is the observer-area list at
+/api/config/regions, which holds IATA codes:
+
+    GET /api/scope-stats?window=7d
+    -> 200 {"byRegion": [{"name": "#tx-dfw", "count": 1203}, ...], ...}
+       packets its observers matched to each region it holds a key for
+    GET /api/scope-audit?window=1h
+    -> 200 {"repeaters": [{"publicKey", "declaredRegions": ["tx-dfw", ...]}, ...]}
+       what each repeater says it forwards (the window scopes only the
+       forwarding counts, which are not used, and 1h is the cheap one)
+
 Only hop hashes and packet hashes are sent: no names, no positions. That is
 why plain http:// is accepted, for an instance on the LAN.
 """
@@ -46,6 +58,9 @@ MAX_CANDIDATES_PER_HOP = 50
 MAX_HOPS = 64
 MAX_OBSERVATIONS = 500
 NAME_MAX = 32
+MAX_REGIONS = 200
+REGION_NAME_MAX = 32
+AUDIT_TIMEOUT_S = 15.0      # the audit is computed on demand; seconds on a big instance
 
 _HOP_RE = re.compile(r"^(?:[0-9a-f]{2}){1,3}$")
 _KEY_RE = re.compile(r"^(?:[0-9a-f]{2}){4,32}$")
@@ -105,6 +120,29 @@ def _candidate(row: Any, prefix: str) -> Optional[Dict[str, Any]]:
     # CoreScope's hop resolver carries no role or last-heard time.
     return {"pubkey": pk, "name": name, "type": None, "lat": lat, "lon": lon,
             "last_heard": None}
+
+
+def region_name(v: Any) -> Optional[str]:
+    """A region name as CoreScope reports it -> ``#name``, or None.
+
+    The rules are CoreScope's own (regionNameAcceptable): structural, never
+    about meaning. ``*`` is the flood wildcard, not a region; whitespace,
+    commas, a second ``#`` or non-ASCII cannot be part of a name a radio
+    hashes. Case is kept: ``#TX-DFW`` and ``#tx-dfw`` are different keys.
+    ``$`` regions are private and have no key the bot can derive."""
+    if not isinstance(v, str):
+        return None
+    name = v.strip()
+    name = name[1:] if name.startswith("#") else name
+    if not name or name == "*" or name.startswith("$") or len(name) > REGION_NAME_MAX:
+        return None
+    if any(c <= " " or c >= "\x7f" or c in ",#" for c in name):
+        return None
+    return "#" + name
+
+
+def _count(v: Any) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
 
 
 def _observation(row: Any) -> Optional[Dict[str, Any]]:
@@ -214,10 +252,56 @@ class CoreScope:
                 out.append(obs)
         return out
 
-    def _fetch(self, path: str) -> Tuple[int, Any]:
+    def regions(self) -> Dict[str, Any]:
+        """The MeshCore regions CoreScope knows, as
+        ``{"regions": [{name, packets, repeaters}, ...], "partial": None | why}``.
+
+        ``packets``: how many its observers matched to the region in the last
+        7 days. ``repeaters``: how many repeaters declare it. Sorted by
+        packets, then repeaters, then name; at most MAX_REGIONS.
+
+        Traffic stats are required: without them (an older CoreScope, or any
+        network or HTTP failure) this raises CoreScopeError. Declarations are
+        not: when the audit fails the list carries traffic alone and
+        ``partial`` is why (repeater counts are then all 0)."""
+        status, data = self._fetch("/api/scope-stats?window=7d")
+        rows = data.get("byRegion") if isinstance(data, dict) else None
+        if status != 200 or not isinstance(rows, list):
+            err = data.get("error") if isinstance(data, dict) else None
+            raise CoreScopeError("region stats: HTTP %s %s"
+                                 % (status, err or "unexpected response"))
+        packets: Dict[str, int] = {}
+        for row in rows:
+            name = region_name(row.get("name")) if isinstance(row, dict) else None
+            if name is not None:
+                packets[name] = packets.get(name, 0) + _count(row.get("count"))
+
+        repeaters: Dict[str, int] = {}
+        partial = None
+        try:
+            status, data = self._fetch("/api/scope-audit?window=1h", AUDIT_TIMEOUT_S)
+            reps = data.get("repeaters") if isinstance(data, dict) else None
+            if status != 200 or not isinstance(reps, list):
+                err = data.get("error") if isinstance(data, dict) else None
+                raise CoreScopeError("HTTP %s %s" % (status, err or "unexpected response"))
+            for rep in reps:
+                declared = rep.get("declaredRegions") if isinstance(rep, dict) else None
+                names = {region_name(n) for n in declared} if isinstance(declared, list) else ()
+                for name in names:
+                    if name is not None:
+                        repeaters[name] = repeaters.get(name, 0) + 1
+        except CoreScopeError as exc:
+            partial = str(exc) or type(exc).__name__
+
+        out = [{"name": n, "packets": packets.get(n, 0), "repeaters": repeaters.get(n, 0)}
+               for n in set(packets) | set(repeaters)]
+        out.sort(key=lambda r: (-r["packets"], -r["repeaters"], r["name"]))
+        return {"regions": out[:MAX_REGIONS], "partial": partial}
+
+    def _fetch(self, path: str, timeout: float = TIMEOUT_S) -> Tuple[int, Any]:
         headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
         try:
-            return self._get(self.base + path, headers, TIMEOUT_S)
+            return self._get(self.base + path, headers, timeout)
         except CoreScopeError:
             raise
         except Exception as exc:

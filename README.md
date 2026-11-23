@@ -28,6 +28,7 @@ plugin's page in the openHop web UI.
 
 - Custom commands with reply templates ([docs/TEMPLATES.md](docs/TEMPLATES.md)), and aliases
 - Scope commands by channel, region, DM or hop count. The bot never replies on Public.
+- A region table that pulls the regions CoreScope knows and marks the ones this radio has verified on air
 - Per-sender limits that follow the sender across channels, plus airtime limits
 - Bans by regular expression, and optional automatic bans for senders who keep hitting the limits
 - Channel traffic by region: how much of each channel's traffic has no region

@@ -837,8 +837,258 @@ function tabCommands() {
 }
 
 // ---------------------------------------------------------------- tab: scope
+/* '#name' for a usable region name, else null. CoreScope's rules: printable
+ * ASCII, no spaces, commas or second '#', at most 32 characters; '$' regions
+ * are private and have no key the bot can derive. Case is kept: it changes the key. */
+function regionCanon(v) {
+  let n = String(v ?? '').trim();
+  if (n.startsWith('#')) n = n.slice(1);
+  if (!n || n === '*' || n.startsWith('$') || n.length > 32 || !/^[\x21-\x7e]+$/.test(n) || /[,#]/.test(n)) return null;
+  return '#' + n;
+}
+const regionKey = (v) => regionCanon(v) || String(v ?? '').trim();
+const plural = (n, one, many) => Number(n).toLocaleString() + ' ' + (n === 1 ? one : (many || one + 's'));
+function listText(a) { return a.length <= 2 ? a.join(' and ') : a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1]; }
+
+/* One plain sentence: where the bot answers right now, from the working config. */
+function scopeSummary() {
+  const s = cfg.scope;
+  const prot = s.protected_channels.map((x) => String(x).trim()).filter(Boolean);
+  const where = s.channels.length ? 'on ' + listText(s.channels) : 'on every channel' + (prot.length ? ' except ' + listText(prot) : '');
+  const regions = s.regions.length ? 'only in ' + listText(s.regions.map((r) => (r === '*' ? 'messages with no region' : r))) : 'in any region';
+  const out = ['Answers ' + where + ', ' + regions + (s.allow_dm ? ', and in direct messages.' : '. Ignores direct messages.')];
+  if (s.channels.length && prot.length) out.push('Never answers on ' + listText(prot) + '.');
+  if (s.max_hops != null && s.max_hops !== '' && isFinite(s.max_hops)) out.push('Ignores requests from more than ' + plural(s.max_hops, 'hop') + ' away.');
+  const own = cfg.commands.filter((m) => (m.channels || []).length || (m.regions || []).length || m.dm != null).length;
+  if (own) out.push(own === 1 ? 'One command sets its own scope on the Commands tab.' : own + ' commands set their own scope on the Commands tab.');
+  return out.join(' ');
+}
+
+// Kept across redraws of the tab: rows unticked this session stay listed.
+const scopeUI = { filter: '', showAll: false, extra: new Set(), lastOnly: null, refreshing: false };
+const ROWS_COLLAPSED = 8;
+
 function tabScope() {
   const s = cfg.scope;
+  const summary = h('p', { class: 'summary-line' });
+  const sync = () => { summary.textContent = scopeSummary(); drawRegions(true); };
+
+  // ------------------------------------------------------------ regions
+  const regionsBox = h('div');
+  const statusBox = h('div', { class: 'rg-status', 'aria-live': 'polite' });
+  const refreshBtn = h('button', { type: 'button', text: 'Refresh from CoreScope', onclick: async () => {
+    scopeUI.refreshing = true; drawRegions(true);
+    const r = await runAction('corescope_regions', {}, { timeout: 30000 });
+    scopeUI.refreshing = false;
+    if (r) {
+      const res = r.result;
+      if (!res) toast('Asked the bot; no answer yet. Is it running?', true);
+      else if (!res.ok) toast(res.error || 'Refresh failed', true);
+      else toast('CoreScope lists ' + plural(res.regions, 'region') + '.' + (res.partial ? ' Repeater counts were unavailable.' : ''));
+    }
+    drawRegions(true);
+  } });
+
+  const mode = () => (s.regions.length ? 'only' : 'any');
+  const setMode = (m) => {
+    if (m === mode()) return;
+    if (m === 'any') { scopeUI.lastOnly = [...s.regions]; s.regions.splice(0); }
+    else {
+      const back = (scopeUI.lastOnly || []).filter((r) => r === '*' || cfg.regions.some((x) => regionKey(x) === regionKey(r)));
+      const next = back.length ? back : [...new Set([...cfg.regions, '*'])];
+      s.regions.splice(0, s.regions.length, ...next);
+    }
+    changed(); sync();
+  };
+  const modeName = 'rg-mode-' + (++uid);
+  const radio = (val, label, hint) => {
+    const el = h('input', { type: 'radio', name: modeName, value: val, checked: mode() === val, 'data-k': 'mode-' + val });
+    el.addEventListener('change', () => { if (el.checked) setMode(val); });
+    return h('label', { class: 'radio' }, el, h('span', {}, h('b', { text: label }), h('span', { class: 'muted', text: ' ' + hint })));
+  };
+
+  // Use matches names exactly: a region's key depends on its case. Answer
+  // matches the way the bot's scope check does, ignoring case.
+  const inList = (arr, name) => arr.findIndex((x) => regionKey(x) === name);
+  const lc = (v) => regionKey(v).toLowerCase();
+  const answerIdx = (name) => s.regions.reduce((a, x, i) => (x !== '*' && lc(x) === lc(name) ? [...a, i] : a), []);
+  const usedAnyCase = (name) => cfg.regions.some((x) => lc(x) === lc(name));
+  const dropAnswers = (idx) => { idx.slice().reverse().forEach((j) => s.regions.splice(j, 1)); };
+  const setUse = (name, on) => {
+    const i = inList(cfg.regions, name);
+    if (on && i < 0) cfg.regions.push(name);
+    if (!on && i >= 0) {
+      // Answers for it only go when no other spelling of the name stays in use.
+      const orphaned = cfg.regions.filter((x, k) => k !== i && lc(x) === lc(name)).length ? [] : answerIdx(name);
+      if (orphaned.length && orphaned.length === s.regions.length) {
+        toast(name + ' is the only region the bot answers in. Tick another under Answer first, or choose "Any region".', true);
+        return false;
+      }
+      dropAnswers(orphaned);
+      cfg.regions.splice(i, 1);
+      scopeUI.extra.add(name);
+    }
+    changed(); sync(); return true;
+  };
+  const setAnswer = (name, on) => {
+    const idx = name === '*' ? (s.regions.includes('*') ? [s.regions.indexOf('*')] : []) : answerIdx(name);
+    if (on && !idx.length) s.regions.push(name);
+    if (!on && idx.length) {
+      if (idx.length === s.regions.length) { toast('Keep at least one ticked, or choose "Any region".', true); return false; }
+      dropAnswers(idx);
+    }
+    changed(); sync(); return true;
+  };
+
+  const addIn = h('input', { class: 'mono', placeholder: '#tx-dfw', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Region to add', 'aria-describedby': 'rg-add-msg', 'data-k': 'add' });
+  const addMsg = h('p', { class: 'hint', id: 'rg-add-msg' });
+  const addRegion = () => {
+    const name = regionCanon(addIn.value);
+    addMsg.classList.remove('form-err');
+    if (!name) {
+      addMsg.textContent = 'Use a name like #tx-dfw: up to 32 characters, no spaces or commas. Private $ regions are not supported.';
+      addMsg.classList.add('form-err'); addIn.setAttribute('aria-invalid', 'true'); addIn.focus(); return;
+    }
+    addIn.setAttribute('aria-invalid', 'false'); addIn.value = '';
+    const had = inList(cfg.regions, name) >= 0;
+    addMsg.textContent = had ? name + ' is already in use.' : 'Added ' + name + '. Save to apply.';
+    scopeUI.extra.add(name);
+    if (!had) setUse(name, true); else drawRegions(true);
+  };
+  addIn.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); addRegion(); } });
+
+  const filterIn = h('input', { type: 'search', placeholder: 'Filter regions', autocomplete: 'off', 'aria-label': 'Filter regions', 'data-k': 'filter' });
+  filterIn.value = scopeUI.filter;
+  filterIn.addEventListener('input', () => { scopeUI.filter = filterIn.value; drawRegions(true); });
+
+  function rows() {
+    const R = rt && rt.regions;
+    const cs = (R && R.corescope) || {};
+    const heard = new Map(((R && R.heard) || []).map((x) => [x.name, x]));
+    const csRows = new Map((cs.regions || []).map((x) => [x.name, x]));
+    const watching = new Set((R && R.watching) || []);
+    const names = new Set(cfg.regions.map(regionKey));
+    // An answered name with no region in use under any spelling gets its own row (it never matches).
+    s.regions.filter((r) => r !== '*' && !usedAnyCase(r)).forEach((r) => names.add(regionKey(r)));
+    [...heard.keys(), ...csRows.keys(), ...scopeUI.extra].forEach((n) => names.add(n));
+    return [...names].filter(Boolean).map((name) => {
+      const hd = heard.get(name) || null;
+      return { name, used: inList(cfg.regions, name) >= 0, usedAnyCase: usedAnyCase(name), answered: answerIdx(name).length > 0,
+        heard: hd, cs: csRows.get(name) || null, watching: watching.has(name), live: !!(hd && hd.packets > 0) };
+    }).sort((a, b) => (b.used - a.used) || ((b.heard && b.heard.verified ? 1 : 0) - (a.heard && a.heard.verified ? 1 : 0)) || (b.live - a.live)
+      || ((b.cs ? b.cs.packets : -1) - (a.cs ? a.cs.packets : -1)) || ((b.cs ? b.cs.repeaters : 0) - (a.cs ? a.cs.repeaters : 0)) || a.name.localeCompare(b.name));
+  }
+
+  function heardCell(r) {
+    const R = rt && rt.regions;
+    if (!R) return h('span', { class: 'muted', text: '-', title: 'The bot has not reported yet.' });
+    const hd = r.heard;
+    if (hd && hd.verified) return [h('span', { class: 'mark ok', text: '✓ Verified' }), h('span', { class: 'sub', text: plural(hd.packets, 'packet') + ' in 7 days · ' + ago(hd.last_heard) })];
+    if (hd && hd.packets > 0) return [h('span', { class: 'mark heard', text: 'Heard, not confirmed', title: 'Too few packets to rule out chance: a region code is 16 bits, so unrelated packets match now and then.' }), h('span', { class: 'sub', text: plural(hd.packets, 'packet') + ' in 7 days · ' + ago(hd.last_heard) })];
+    if (hd && hd.last_heard) return [h('span', { class: 'muted', text: 'Not this week' }), h('span', { class: 'sub', text: 'last heard ' + ago(hd.last_heard) })];
+    if (!r.watching) return h('span', { class: 'muted', text: 'Not listening', title: r.cs ? 'The bot listens for the 64 busiest regions CoreScope lists. Tick Use to listen for this one.' : 'Tick Use to listen for this region.' });
+    return h('span', { class: 'muted', text: 'Not heard yet' });
+  }
+  function csCell(r, csOn) {
+    if (!csOn) return h('span', { class: 'muted', text: '-' });
+    if (!r.cs) return h('span', { class: 'muted', text: 'Not listed' });
+    return [h('span', { text: r.cs.packets ? plural(r.cs.packets, 'packet') : 'No traffic' }),
+      r.cs.repeaters ? h('span', { class: 'sub', text: plural(r.cs.repeaters, 'repeater') + (r.cs.repeaters === 1 ? ' carries it' : ' carry it') }) : null];
+  }
+  const box = (checked, label, key, onToggle, o = {}) => {
+    const el = h('input', { type: 'checkbox', checked, disabled: o.disabled, 'aria-label': label, 'data-k': key, title: o.title });
+    el.addEventListener('change', () => { if (!onToggle(el.checked)) el.checked = !el.checked; });
+    return h('label', { class: 'hit', title: o.title }, el);
+  };
+
+  function drawRegions(force) {
+    const R = rt && rt.regions;
+    const cs = (R && R.corescope) || {};
+    const csOn = !!cfg.corescope.enabled;
+    const all = rows();
+    const only = mode() === 'only';
+    const f = scopeUI.filter.trim().toLowerCase();
+    const shown = f ? all.filter((r) => r.name.toLowerCase().includes(f)) : all;
+    const key = (r) => r.used || r.answered || r.live || scopeUI.extra.has(r.name);
+    let list = shown;
+    let hidden = 0;
+    if (!f && !scopeUI.showAll) {
+      const rest = shown.filter((r) => !key(r));
+      const keep = new Set(rest.slice(0, Math.max(0, ROWS_COLLAPSED - shown.filter(key).length)).map((r) => r.name));
+      list = shown.filter((r) => key(r) || keep.has(r.name));
+      hidden = shown.length - list.length;
+    }
+    const unknownSeen = Number(((rt && rt.regions_seen) || {})['?'] || 0);
+    // Built from what is displayed, so the 3 s poll does not replace the table
+    // (and swallow a click) whenever a packet bumps a count nobody sees.
+    const sig = JSON.stringify([list.map((r) => [r.name, r.used, r.usedAnyCase, r.answered, r.watching,
+      r.heard && [r.heard.verified, r.heard.packets, ago(r.heard.last_heard)], r.cs && [r.cs.packets, r.cs.repeaters]]),
+    hidden, all.length, only, csOn, !!R, rtState === 'ok', cs.error || null, cs.error_at ? ago(cs.error_at) : null, cs.fetched_at ? ago(cs.fetched_at) : null,
+    cs.partial || null, (cs.regions || []).length, s.regions.includes('*'), scopeUI.filter, scopeUI.showAll, scopeUI.refreshing, only && unknownSeen]);
+    if (!force && regionsBox._sig === sig) return;
+    regionsBox._sig = sig;
+    const focusKey = document.activeElement && regionsBox.contains(document.activeElement) ? document.activeElement.getAttribute('data-k') : null;
+
+    // status line + refresh
+    refreshBtn.disabled = !csOn || scopeUI.refreshing;
+    refreshBtn.textContent = scopeUI.refreshing ? 'Refreshing…' : 'Refresh from CoreScope';
+    let status;
+    if (!csOn) status = [h('span', { text: 'CoreScope is off, so only regions you add are listed. ' }), h('button', { type: 'button', class: 'link', text: 'Set up CoreScope', onclick: () => go('corescope') })];
+    else if (!R) status = h('span', { class: 'muted', text: rtState === 'ok' ? 'This version of the bot does not report regions yet. Save, and let it restart or update.' : 'Waiting for the bot to report.' });
+    else if (cs.error) status = h('span', { class: 'notice' }, h('b', { text: 'Last refresh failed' + (cs.error_at ? ' ' + ago(cs.error_at) : '') + ': ' }), String(cs.error).replace(/[.\s]*$/, '.') + (cs.fetched_at ? ' Showing the list from ' + ago(cs.fetched_at) + '.' : ''));
+    else if (!cs.fetched_at) status = h('span', { class: 'muted', text: 'Not fetched from CoreScope yet. The bot fetches the list on start and every 6 hours.' });
+    else status = h('span', { class: 'muted', text: plural((cs.regions || []).length, 'region') + ' from CoreScope, updated ' + ago(cs.fetched_at) + '.' + (cs.partial ? ' Repeater counts were unavailable (' + cs.partial + ').' : '') });
+    statusBox.replaceChildren(h('span', {}, status));
+
+    const head = ['Use', 'Region', 'Heard here', ...(csOn ? ['CoreScope (7 days)'] : []), ...(only ? ['Answer'] : [])];
+    const tips = { 'Heard here': 'Packets this radio heard in the region over the last 7 days. Verified: at least 3 separate packets, more than chance could explain.',
+      'CoreScope (7 days)': 'Packets CoreScope\'s observers matched to the region, and how many repeaters say they carry it.' };
+    const body = list.map((r) => h('tr', { class: r.used ? '' : 'off' },
+      h('td', { class: 'c-check c-use' }, box(r.used, 'Use ' + r.name, 'use:' + r.name, (on) => setUse(r.name, on))),
+      h('th', { scope: 'row', class: 'mono rg-name' }, r.name,
+        r.answered && !r.usedAnyCase ? h('span', { class: 'sub warn-text', text: 'Never matches: tick Use' }) : null),
+      h('td', { class: 'c-heard', 'data-label': 'Heard here' }, heardCell(r)),
+      csOn ? h('td', { class: 'c-cs', 'data-label': 'CoreScope' }, csCell(r, csOn)) : null,
+      only ? h('td', { class: 'c-check c-ans', 'data-label': 'Answer' }, box(r.answered, 'Answer in ' + r.name, 'ans:' + r.name, (on) => setAnswer(r.name, on),
+        { disabled: !r.usedAnyCase && !r.answered, title: !r.usedAnyCase ? 'Tick Use first: the bot cannot tell when a message is in this region.' : null })) : null));
+    if (only && (!f || 'no region'.includes(f) || f === '*')) {
+      body.push(h('tr', { class: 'special' },
+        h('td', { class: 'c-check c-use' }),
+        h('th', { scope: 'row' }, h('span', { class: 'mono', text: '*' }), ' no region', h('span', { class: 'sub', text: 'A plain flood, which every repeater forwards' })),
+        h('td', { class: 'muted c-heard', text: '-' }), csOn ? h('td', { class: 'muted c-cs', text: '-' }) : null,
+        h('td', { class: 'c-check c-ans', 'data-label': 'Answer' }, box(s.regions.includes('*'), 'Answer messages with no region', 'ans:*', (on) => setAnswer('*', on)))));
+    }
+
+    let table = null;
+    const empty = !all.length ? h('div', { class: 'empty' }, h('p', {}, h('b', { text: 'No regions yet.' })),
+      h('p', { class: 'muted', text: csOn ? 'Refresh from CoreScope to list the regions it knows, or add one below.' : 'Add the regions your mesh uses below, or turn on CoreScope to list the ones it knows.' })) : null;
+    if (!body.length) {
+      if (all.length) table = h('p', { class: 'muted pad-s', text: 'No region matches "' + scopeUI.filter + '".' });
+    } else {
+      table = h('div', { class: 'tablewrap' }, h('table', { class: 'rg-table' + (only ? ' with-answer' : '') },
+        h('thead', {}, h('tr', {}, head.map((t) => h('th', { scope: 'col', class: t === 'Use' || t === 'Answer' ? 'c-check' : '', title: tips[t] || null, text: t })))),
+        h('tbody', {}, body)));
+    }
+    const more = hidden || scopeUI.showAll
+      ? h('button', { type: 'button', class: 'link', 'data-k': 'more', text: scopeUI.showAll ? 'Show fewer' : 'Show ' + plural(hidden, 'more region'), onclick: () => { scopeUI.showAll = !scopeUI.showAll; drawRegions(true); } })
+      : null;
+
+    regionsBox.replaceChildren(...[
+      h('fieldset', { class: 'modes' }, h('legend', { text: 'Answer requests from' }),
+        radio('any', 'Any region', '(and from messages with no region)'),
+        radio('only', 'Only the regions ticked under Answer', '(requests that arrive direct-routed are always answered)')),
+      only ? h('p', { class: 'hint' }, 'A request in a region the bot can\'t recognise (not ticked under Use) is not answered in this mode'
+        + (unknownSeen ? ': ' + plural(unknownSeen, 'request') + ' arrived like that since the bot started.' : '.')) : null,
+      all.length > ROWS_COLLAPSED || scopeUI.filter ? h('div', { class: 'row rg-tools' }, filterIn) : null,
+      empty, table, more ? h('p', {}, more) : null].filter(Boolean));
+    if (focusKey) {
+      const el = [...regionsBox.querySelectorAll('[data-k]')].find((x) => x.getAttribute('data-k') === focusKey);
+      if (el) el.focus();
+    }
+  }
+  drawRegions(true);
+
+  // ------------------------------------------------------------ channels
   const chRows = h('div');
   const renderCh = () => {
     chRows.replaceChildren(h('div', { class: 'tablewrap' }, h('table', {},
@@ -862,7 +1112,8 @@ function tabScope() {
     prov.disabled = false; pres.replaceChildren(r ? resultNode(r) : '');
   } });
   const pres = h('div', { 'aria-live': 'polite' });
-  const regIn = chips(cfg.regions, { aria: 'Add region', ph: '#tx-dfw', onchange: () => {} });
+
+  // ------------------------------------------------------------ unscoped replies
   const nudgeList = h('div');
   const openChannels = () => channelNames().filter((n) => !cfg.scope.protected_channels.map(chanNorm).includes(chanNorm(n)));
   const renderNudges = () => {
@@ -888,29 +1139,39 @@ function tabScope() {
     cfg.nudges.push({ channel: ch, enabled: true, region: regionNames()[0] || '', per_sender: 1, per_channel: 6, window_h: 24, text: NUDGE_TEXT });
     changed(); renderNudges();
   } });
+
+  summary.textContent = scopeSummary();
   return { el: h('div', {},
-    h('div', { class: 'card' }, h('h2', { text: 'What region scoping does' }),
-      h('p', { text: 'MeshCore regions are transport-code scopes. A region-scoped flood packet carries a 16-bit code derived from the region name, so repeaters can filter traffic by region. The bot checks each request against every region listed below to learn which one it arrived under.' }),
-      h('p', { class: 'hint', text: 'A request region is #name (a configured region), * (plain unscoped flood), ? (a region not in your list: fails closed whenever a region list is set) or direct (always allowed). With "reply in request region" on, answers go out under the region the question arrived in.' })),
-    h('div', { class: 'card stack' }, h('h2', { text: 'Regions' }),
-      h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Known regions (names start with #)' }), regIn)),
-    h('div', { class: 'card stack' }, h('h2', { text: 'Global scope' }),
-      h('p', { class: 'hint', text: 'A command fires only if every check passes. Per-command settings override these; empty means inherit.' }),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Where the bot answers' }), summary,
+      h('details', { class: 'explain' }, h('summary', { text: 'How region scoping works' }),
+        h('p', { text: 'MeshCore regions are transport-code scopes. A region-scoped flood packet carries a 16-bit code derived from the region name, so repeaters can filter traffic by region. A radio cannot read the name off the air: the bot tests each packet against the regions ticked under Use to learn which one it arrived in.' }),
+        h('p', { class: 'hint', text: 'A request arrives in #name (a region ticked under Use), * (a plain flood with no region), ? (a region the bot cannot name: never answered while you answer only in ticked regions) or direct (always answered). With "Reply in the region the request arrived in" on, answers go out in that same region. Each command can narrow all of this on the Commands tab.' }))),
+    h('div', { class: 'card stack' },
+      h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Regions' }), refreshBtn),
+      statusBox,
+      h('p', { class: 'hint', text: 'Tick Use for each region the bot should recognise. The bot also listens for the regions CoreScope lists, so you can see one is live before you use it.' }),
+      regionsBox,
+      h('div', { class: 'rg-add' },
+        h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Add a region' }), h('div', { class: 'row' }, addIn, h('button', { type: 'button', text: 'Add', onclick: addRegion }))),
+        addMsg)),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Channels' }),
       h('div', { class: 'grid wide' },
-        h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Answer on channels' }), chips(s.channels, { suggest: channelNames, aria: 'Add channel', ph: 'Channel name', inherit: 'all channels except protected' })),
-        h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Answer in regions (* = unscoped)' }), chips(s.regions, { suggest: () => ['*', ...regionNames()], aria: 'Add region', ph: '#region or *', inherit: 'any region' })),
-        h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Protected channels (never answered)' }), chips(s.protected_channels, { suggest: () => ['Public'], aria: 'Add protected channel', ph: 'Public' })),
-        field('Max hops', numIn(s, 'max_hops', { nullable: true, min: 0, step: 1, ph: 'no limit' }), 'Ignore requests that travelled further than this. Empty = no limit.')),
-      check('Answer direct messages by default', s, 'allow_dm', { onchange: () => {} }),
-      check('Reply in the region the request arrived under', cfg.limits, 'reply_in_request_region')),
+        h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Answer on channels' }), chips(s.channels, { suggest: channelNames, aria: 'Add channel', ph: 'Channel name', inherit: 'all channels except protected', onchange: sync })),
+        h('div', { class: 'field' }, h('span', { class: 'lbl', text: 'Protected channels (never answered)' }), chips(s.protected_channels, { suggest: () => ['Public'], aria: 'Add protected channel', ph: 'Public', onchange: sync }))),
+      h('div', { class: 'row sub-head' }, h('h3', { class: 'grow', text: 'Channel slots on the radio' }),
+        h('button', { type: 'button', text: 'Add channel slot', onclick: () => { let n = 1; const used = new Set(cfg.channels.map((c) => c.idx)); while (used.has(n) && n < 40) n++; cfg.channels.push({ idx: n, name: '#' }); changed(); renderCh(); } }), prov),
+      h('p', { class: 'hint', text: 'Slot 1 to 39 on the companion radio. Hashtag channels (#name) derive their key from the name; anything else needs a 32-hex secret. Save, then provision to write them to the radio.' }),
+      chRows, pres),
+    h('div', { class: 'card stack' }, h('h2', { text: 'Other rules' }),
+      h('div', { class: 'checks' },
+        check('Answer direct messages by default', s, 'allow_dm', { onchange: sync }),
+        check('Reply in the region the request arrived in', cfg.limits, 'reply_in_request_region')),
+      field('Max hops', numIn(s, 'max_hops', { nullable: true, min: 0, step: 1, ph: 'no limit', onchange: sync }), 'Ignore requests that travelled further than this. Empty = no limit.', 'narrow')),
     h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Replies to unscoped senders' }), addNudge),
       h('p', { text: 'Off unless you turn it on for a channel. When the radio hears someone on that channel send a message with no region (a plain flood, which every repeater forwards across the whole mesh), the bot replies to suggest they set one.' }),
-      h('p', { class: 'hint', text: 'The bot replies only when the packet it heard was a plain flood that decrypts to exactly that message, and waits a few seconds first: if any copy of the packet turns out to carry a region, it stays quiet. Messages it cannot match are never answered. It needs the channel\'s key, so the channel must be a slot listed below (or Public). Banned senders and protected channels never get one. The Usage tab shows how much of each channel\'s traffic is unscoped.' }),
-      nudgeList, datalist('dl-nch', openChannels()), datalist('dl-nrg', ['*', ...regionNames()])),
-    h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Channel slots' }),
-      h('button', { type: 'button', text: 'Add channel', onclick: () => { let n = 1; const used = new Set(cfg.channels.map((c) => c.idx)); while (used.has(n) && n < 40) n++; cfg.channels.push({ idx: n, name: '#' }); changed(); renderCh(); } }), prov),
-      h('p', { class: 'hint', text: 'Slot 1 to 39 on the companion radio. Hashtag channels (#name) derive their key from the name; anything else needs a 32-hex secret. Save, then provision to write them to the radio.' }),
-      chRows, pres)) };
+      h('p', { class: 'hint', text: 'The bot replies only when the packet it heard was a plain flood that decrypts to exactly that message, and waits a few seconds first: if any copy of the packet turns out to carry a region, it stays quiet. Messages it cannot match are never answered. It needs the channel\'s key, so the channel must be a slot listed under Channels (or Public). Banned senders and protected channels never get one. The Usage tab shows how much of each channel\'s traffic is unscoped.' }),
+      nudgeList, datalist('dl-nch', openChannels()), datalist('dl-nrg', ['*', ...regionNames()]))),
+  refresh: () => drawRegions(false) };
 }
 
 // ---------------------------------------------------------------- tab: moderation
