@@ -1,12 +1,15 @@
 import copy
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
+from openhop_openbot import __version__
 from openhop_openbot.config import validate
 from openhop_openbot.engine.bot import Engine, Request
+from openhop_openbot.engine import builtins
 from openhop_openbot.engine.builtins import BUILTINS, HELP
 from openhop_openbot.engine.schedule import Schedule
 from openhop_openbot.engine.templates import clamp_bytes, render
@@ -255,3 +258,40 @@ def test_default_ping_reply():
     eng, _ = make()
     res = eng.handle(req(ts=1_700_000_000, heard_at=1_700_000_004.6027))
     assert res.reply == "@[bob] pong! 2 hops traversed, took 4.6 seconds."
+
+
+# ---------------------------------------------------------------- about ----
+
+def test_default_about_reply():
+    eng, _ = make(started_at=time.time() - (3 * 86400 + 4 * 3600 + 60))
+    res = eng.handle(req("!about"))
+    assert res.matched == "about"
+    assert res.reply == ("OpenBot %s: MeshCore command bot for openHop Repeater. Up 3d04h."
+                         " !help for commands. github.com/zfouts/openhop-openbot-plugin"
+                         % __version__)
+
+
+def test_about_names_the_help_trigger_only_when_a_help_command_is_on():
+    eng, _ = make()
+    help_cmd = next(c for c in eng.cfg["commands"] if c["id"] == "help")
+    help_cmd["trigger"] = "?cmds"
+    assert " ?cmds for commands. " in BUILTINS["about"](eng.context(), None)
+    help_cmd["enabled"] = False
+    assert "for commands" not in BUILTINS["about"](eng.context(), None)
+
+
+def test_about_without_uptime_leaves_it_out():
+    eng, _ = make()
+    assert " Up " not in BUILTINS["about"](eng.context(), None)
+
+
+def test_about_drops_uptime_then_help_then_link_to_fit(monkeypatch):
+    monkeypatch.setattr(builtins, "__version__", "1.2.1+edge." + "9" * 40)
+    ctx = {"started_at": time.time() - 3600,
+           "commands": [{"trigger": "!help", "reply": "{help}"}]}
+    out = BUILTINS["about"](ctx, None)
+    assert out.startswith("OpenBot 1.2.1+edge.999") and len(out.encode()) <= 160
+    assert " Up " not in out and out.endswith("github.com/zfouts/openhop-openbot-plugin")
+    monkeypatch.setattr(builtins, "__version__", "1.2.1+edge." + "9" * 80)
+    out = BUILTINS["about"](ctx, None)
+    assert len(out.encode()) <= 160 and "github.com" not in out

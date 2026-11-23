@@ -431,6 +431,34 @@ def fn_uptime(ctx, arg):
     return "up " + fmt_span(time.time() - (ctx.get("started_at") or time.time()))
 
 
+ABOUT_LINK = "github.com/zfouts/openhop-openbot-plugin"
+
+
+def _help_trigger(ctx: Dict[str, Any]) -> Optional[str]:
+    """Trigger of the first enabled command whose reply uses {help}."""
+    for c in ctx.get("commands") or []:
+        trig = str(c.get("trigger") or "").strip()
+        if trig and re.search(r"\{help\b", str(c.get("reply") or "")):
+            return trig
+    return None
+
+
+def fn_about(ctx, arg):
+    """What is answering: OpenBot and its version, uptime, the help command
+    (when one is on) and the repository. When that is too long for one
+    message, uptime goes first, then the help pointer, then the link."""
+    head = "OpenBot %s: MeshCore command bot for openHop Repeater." % __version__
+    started = ctx.get("started_at")
+    up = " Up %s." % fmt_span(time.time() - started) if started else ""
+    trig = _help_trigger(ctx)
+    hint = " %s for commands." % trig if trig else ""
+    link = " " + ABOUT_LINK
+    for out in (head + up + hint + link, head + hint + link, head + link, head):
+        if fits(out):
+            return out
+    return clamp_bytes(head)
+
+
 def _ctx(key: str, default: str = ""):
     def fn(ctx, arg):
         v = ctx.get(key)
@@ -482,6 +510,7 @@ BUILTINS = {
     "help": fn_help,
     "uptime": fn_uptime,
     "version": lambda ctx, a: "openbot " + __version__,
+    "about": fn_about,
 }
 
 HELP = {
@@ -524,6 +553,8 @@ HELP = {
     "help": "List enabled command triggers",
     "uptime": "Bot uptime",
     "version": "Plugin version",
+    "about": "What this bot is: OpenBot version, uptime, the help command and a link"
+             " to the repository",
 }
 
 

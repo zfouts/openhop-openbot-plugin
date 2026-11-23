@@ -226,6 +226,21 @@ New installs have the `!mpath` command. If your saved commands came from an
 older version, open the CoreScope tab and click **Add the !mpath command**,
 then save.
 
+## `!about`
+
+`!about` says what is answering and which version it runs:
+
+```
+OpenBot 1.3.0: MeshCore command bot for openHop Repeater. Up 3d04h. !help for commands. github.com/zfouts/openhop-openbot-plugin
+```
+
+It names your help command's trigger, or leaves that part out when no
+enabled command uses `{help}`.
+
+New installs have the `!about` command. If your saved commands came from an
+older version, open the Commands tab and click **Add the !about command**,
+then save.
+
 ## Usage
 
 The bot records every request that matches a command trigger in its SQLite

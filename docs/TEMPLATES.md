@@ -62,6 +62,7 @@ It prints the result and its byte count. Roster built-ins see an empty roster.
 | `{help}` | Triggers of enabled commands (commands using `{mpath}` only when CoreScope is on) | `cmds: !path !ping !seen` |
 | `{uptime}` | Bot uptime | `up 3d04h` |
 | `{version}` | Plugin version | `openbot 1.0.0` |
+| `{about}` | What the bot is: OpenBot and its version, uptime, the trigger of the enabled `{help}` command (left out when there is none) and the repository. Uptime, then the help pointer, then the link are dropped if it would not fit one message | `OpenBot 1.3.0: MeshCore command bot for openHop Repeater. Up 3d04h. !help for commands. github.com/zfouts/openhop-openbot-plugin` |
 
 `{path}` and `{pathnames}` also queue a second message asking for 2-byte
 hashes when the request used 1-byte hashes (rate limited per sender).

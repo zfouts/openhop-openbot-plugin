@@ -17,6 +17,7 @@ repeater, with no server.
 | `!stats` | Roster and traffic counts |
 | `!wx <place>` | Weather forecast (off by default) |
 | `!help` | The list of commands |
+| `!about` | What the bot is and the version it runs |
 
 You can switch each one on or off and add your own commands from the
 plugin's page in the openHop web UI.

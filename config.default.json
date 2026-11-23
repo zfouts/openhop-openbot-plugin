@@ -125,6 +125,17 @@
       "regions": [],
       "dm": null,
       "cooldown_s": 30
+    },
+    {
+      "id": "about",
+      "enabled": true,
+      "trigger": "!about",
+      "description": "What this bot is and the version it runs",
+      "reply": "{about}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
     }
   ],
   "announcements": [],
