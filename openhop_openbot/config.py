@@ -159,6 +159,11 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         problems.append(f"node.path_hash_bytes must be 1, 2 or 3 (got {hb!r})")
         cfg.setdefault("node", {})["path_hash_bytes"] = None
 
+    from .mesh.airtime import DEFAULT_PREAMBLE, PREAMBLE_RANGE
+    if isinstance(cfg.get("node"), dict):
+        _number(cfg["node"], "preamble_symbols", DEFAULT_PREAMBLE, *PREAMBLE_RANGE,
+                "node.preamble_symbols", problems, integer=True)
+
     name = str((cfg.get("node") or {}).get("name") or "").strip()
     if len(name.encode("utf-8")) > 31:
         problems.append("node.name is %d bytes; the radio keeps at most 31, so it is not "

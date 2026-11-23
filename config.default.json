@@ -11,7 +11,8 @@
     "longitude": null,
     "timezone": "America/Chicago",
     "units": "imperial",
-    "path_hash_bytes": 2
+    "path_hash_bytes": 2,
+    "preamble_symbols": 16
   },
   "channels": [
     {
@@ -142,6 +143,28 @@
       "trigger": "!about",
       "description": "What this bot is and the version it runs",
       "reply": "{about}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
+    },
+    {
+      "id": "region",
+      "enabled": true,
+      "trigger": "!region",
+      "description": "Whether your message carried a region",
+      "reply": "{region_check}",
+      "channels": [],
+      "regions": [],
+      "dm": null,
+      "cooldown_s": 30
+    },
+    {
+      "id": "me",
+      "enabled": true,
+      "trigger": "!me",
+      "description": "What this bot knows about you",
+      "reply": "{me}",
       "channels": [],
       "regions": [],
       "dm": null,

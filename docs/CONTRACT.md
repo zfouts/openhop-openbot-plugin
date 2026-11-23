@@ -18,6 +18,14 @@ The shipped `config.default.json` is the complete schema. A saved config is
 deep-merged over it, so a partial config is valid. Lists replace, they do
 not merge.
 
+### Radio
+
+The companion reports the radio it transmits on; the bot shows it as
+`runtime.status.radio` (`null` until connected) and uses it to estimate
+airtime. The preamble length is not reported: `node.preamble_symbols`
+(4-64, default 16, as most MeshCore radios use) sets it for the estimate.
+It changes nothing on air.
+
 ### Node name
 
 `node.name` is not just a label. If it is set and differs from the
@@ -271,6 +279,33 @@ dry runs), kept 366 days. Result:
                          {"name": "other regions", "requests": 5}]}}
 ```
 
+`airtime` covers what the bot transmitted (the `tx_log` table, kept 366
+days): every reply, follow-up, unscoped reply, announcement, manual send and
+advert, as `sent`, `failed` (the companion refused it) or `dropped` (queue
+full, or stale after 60 s):
+
+```json
+"airtime": {"bucket": "hour",
+            "totals": {"sent": 57, "failed": 0, "dropped": 4, "bytes": 3900,
+                       "airtime_ms": 25800.0, "unestimated": 0, "share_pct": 0.03},
+            "busiest_hour": {"t": 1731099600.0, "label": "Nov 22 22:00",
+                             "airtime_ms": 1800.0, "share_pct": 0.05},
+            "kinds": [{"kind": "reply", "sent": 29, "failed": 0, "dropped": 1,
+                       "bytes": 2000, "airtime_ms": 13000.0}],
+            "series": [{"t": 1731000000.0, "label": "14:00", "counts": {"reply": 2}}]}
+```
+
+Sizes and airtime are estimates: the size from the text (the companion builds
+the packet: header, region codes when scoped, channel hash, MAC and 16-byte
+AES blocks over the timestamp, flags and `name: text`), the airtime from that
+size with the radio settings the companion reports (frequency, bandwidth,
+SF, CR) and `node.preamble_symbols`, using openhop_core's
+`calculate_lora_airtime_ms`. A DM along a known route also carries its hop
+hashes, which the bot can not see; they are not counted. `unestimated` counts
+messages sent before the radio settings were known. `share_pct` is airtime
+over the window; `busiest_hour` is the clock hour with the most. Only the
+bot's own transmission is counted, not repeaters forwarding it.
+
 Skip reasons are `banned`, `cooldown`, `rate limit`, `out of scope`,
 `empty reply` or `other`. In `traffic`, `scoped` is a configured region or
 `other`; `unscoped_pct` is unscoped over scoped plus unscoped, leaving out
@@ -289,6 +324,8 @@ comes back as the action's error.
   "timestamp": 1731170000, "started_at": 1731160000,
   "status": {"companion": "connected", "node_name": "alice-bot",
              "pubkey": "ab12...", "latitude": 32.9, "longitude": -97.3,
+             "radio": {"freq_khz": 910525, "bw_hz": 250000, "sf": 10, "cr": 5,
+                       "preamble": 16},
              "config_problems": []},
   "counters": {"rx_messages": 0, "rx_frames": 0, "commands": 0,
                "replies": 0, "skipped": 0, "tx_sent": 0, "tx_dropped": 0,

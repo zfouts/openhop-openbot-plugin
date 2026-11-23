@@ -115,6 +115,18 @@ CREATE TABLE IF NOT EXISTS nudges (
     sender  TEXT NOT NULL         -- lowercase
 );
 CREATE INDEX IF NOT EXISTS nudges_channel ON nudges (channel, ts);
+
+-- Everything the bot transmitted, or meant to.
+CREATE TABLE IF NOT EXISTS tx_log (
+    id         INTEGER PRIMARY KEY,
+    ts         REAL NOT NULL,
+    kind       TEXT NOT NULL,     -- reply, follow-up, nudge, announce, send, advert
+    channel    TEXT NOT NULL,     -- '#bot' etc., 'dm', or '' for an advert
+    bytes      INTEGER NOT NULL,  -- estimated size on air
+    airtime_ms REAL,              -- estimated time on air; NULL when not sent or radio unknown
+    outcome    TEXT NOT NULL      -- 'sent', 'failed' (companion refused) or 'dropped'
+);
+CREATE INDEX IF NOT EXISTS tx_log_ts ON tx_log (ts);
 """
 
 MSG_RETENTION_S = 7 * 86400
@@ -216,6 +228,24 @@ class Store:
             (needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"), needle),
         )
         return _row(rows[0]) if rows else None
+
+    def nodes_named(self, name: str) -> List[Dict[str, Any]]:
+        """Every node with exactly this name (ignoring case), newest first."""
+        rows = self._q("SELECT * FROM nodes WHERE name = ? COLLATE NOCASE "
+                       "ORDER BY last_heard DESC LIMIT 10", (name.strip(),))
+        return [_row(r) for r in rows]
+
+    def nodes_with_key(self, prefix: str) -> List[Dict[str, Any]]:
+        """Every node whose public key starts with ``prefix`` (hex), newest first."""
+        prefix = prefix.lower()
+        rows = self._q("SELECT * FROM nodes WHERE substr(pubkey, 1, ?) = ? "
+                       "ORDER BY last_heard DESC LIMIT 10", (len(prefix), prefix))
+        return [_row(r) for r in rows]
+
+    def msg_count(self, sender: str, since: int) -> int:
+        (n,) = self._q("SELECT count(*) FROM msgs WHERE sender = ? COLLATE NOCASE AND ts >= ?",
+                       (sender.strip(), since))[0]
+        return int(n)
 
     def position_of(self, name: str) -> Optional[tuple[float, float]]:
         """A node's position by exact name, only when exactly one pubkey has it.
@@ -485,6 +515,19 @@ class Store:
     def drop_nudge(self, row_id: int) -> None:
         self._x("DELETE FROM nudges WHERE id = ?", (row_id,))
 
+    def record_tx(self, *, kind: str, channel: str, nbytes: int, airtime_ms: Optional[float],
+                  outcome: str, ts: Optional[float] = None) -> None:
+        self._x(
+            """INSERT INTO tx_log (ts, kind, channel, bytes, airtime_ms, outcome)
+               VALUES (?,?,?,?,?,?)""",
+            (time.time() if ts is None else ts, kind, channel, nbytes, airtime_ms, outcome))
+
+    def tx_rows(self, since: float, until: float) -> List[Dict[str, Any]]:
+        rows = self._q(
+            """SELECT ts, kind, channel, bytes, airtime_ms, outcome FROM tx_log
+               WHERE ts >= ? AND ts < ? ORDER BY ts, id""", (since, until))
+        return [_row(r) for r in rows]
+
     def nudge_rows(self, since: float, until: float) -> List[Dict[str, Any]]:
         rows = self._q("SELECT ts, channel, sender FROM nudges WHERE ts >= ? AND ts < ?",
                        (since, until))
@@ -501,6 +544,7 @@ class Store:
         self._x("DELETE FROM usage WHERE ts < ?", (now - USAGE_RETENTION_S,))
         self._x("DELETE FROM traffic WHERE hour < ?", ((now - TRAFFIC_RETENTION_S) // 3600,))
         self._x("DELETE FROM nudges WHERE ts < ?", (now - TRAFFIC_RETENTION_S,))
+        self._x("DELETE FROM tx_log WHERE ts < ?", (now - TRAFFIC_RETENTION_S,))
         self._x("DELETE FROM hits WHERE ts < ?", (now - LIMIT_RETENTION_S,))
         self._x("DELETE FROM strikes WHERE ts < ?", (now - LIMIT_RETENTION_S,))
         self._x("DELETE FROM auto_bans WHERE until < ?", (now,))

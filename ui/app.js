@@ -16,7 +16,7 @@ const RECHECK_S = 6 * 3600;
 const DEFAULTS = {
   schema_version: 1, log_level: 'INFO',
   companion: { host: '127.0.0.1', port: 5001 },
-  node: { name: '', latitude: null, longitude: null, timezone: 'America/Chicago', units: 'imperial', path_hash_bytes: 2 },
+  node: { name: '', latitude: null, longitude: null, timezone: 'America/Chicago', units: 'imperial', path_hash_bytes: 2, preamble_symbols: 16 },
   channels: [], regions: [],
   scope: { channels: [], regions: [], allow_dm: true, protected_channels: ['Public'], max_hops: null },
   limits: { tx_gap_s: 2.5, tx_max_per_min: 8, user_cooldown_s: 5, user_max_requests: 8, user_window_s: 600, reply_in_request_region: true },
@@ -254,6 +254,7 @@ function validate() {
   const opt = (v, ...a) => { if (v != null && v !== '') num(v, ...a); };  // missing = the bot's default
   num(c.companion.port, 'Companion port', 1, 65535);
   num(c.node.path_hash_bytes, 'path_hash_bytes', 1, 3);
+  opt(c.node.preamble_symbols, 'Preamble', 4, 64, true);
   num(c.limits.tx_gap_s, 'tx_gap_s', 0); num(c.limits.tx_max_per_min, 'tx_max_per_min', 0); num(c.limits.user_cooldown_s, 'user_cooldown_s', 0);
   opt(c.limits.user_max_requests, 'Most answered commands per sender', 0, 1000, true); opt(c.limits.user_window_s, 'Per-sender window', 10, 86400);
   c.bans.forEach((b, i) => { if (!String(b.pattern || '')) e.push('Ban ' + (i + 1) + ': pattern is required (an empty one would match everyone)'); });
@@ -651,7 +652,7 @@ function tabStatus() {
           h('p', {}, pill(empty ? 'no data' : s.companion || 'unknown', empty ? undefined : s.companion === 'connected')),
           kv([['Host', cfg.companion.host + ':' + cfg.companion.port], ['Uptime', rt && rt.started_at ? dur(Date.now() / 1000 - rt.started_at) : '-'], ['Last update', rt && rt.timestamp ? ago(rt.timestamp) : '-']])),
         h('div', { class: 'card' }, h('h3', { text: 'Node' }),
-          kv([['Name', s.node_name], ['Pubkey', s.pubkey], ['Position', s.latitude != null && s.longitude != null ? s.latitude + ', ' + s.longitude : null]])),
+          kv([['Name', s.node_name], ['Pubkey', s.pubkey], ['Position', s.latitude != null && s.longitude != null ? s.latitude + ', ' + s.longitude : null], ['Radio', s.radio ? radioLabel(s.radio) : null]])),
         h('div', { class: 'card' }, h('h3', { text: 'CoreScope links' }),
           h('p', {}, pill(cfg.corescope.enabled ? 'on' : 'off', cfg.corescope.enabled ? true : undefined)),
           h('p', { class: 'hint', text: cfg.corescope.enabled ? (cfg.corescope.base_url || 'No base URL set.') + ' · links via ' + shortenerLabel(cfg.corescope) + (hasMpath() ? ' · !mpath on' : '') : '!path replies with hop hashes only; !mpath is silent.' }))),
@@ -681,7 +682,14 @@ function inheritChannels() {
 const inheritRegions = () => (cfg.scope.regions.length ? cfg.scope.regions.join(', ') : 'any region');
 
 const NUDGE_TEXT = '@[{sender}] your message had no region, so it flooded the whole mesh. Set a region in your app to keep it local.';
-const ABOUT_CMD = { id: 'about', enabled: true, trigger: '!about', description: 'What this bot is and the version it runs', reply: '{about}', channels: [], regions: [], dm: null, cooldown_s: 30 };
+// Default commands added after 1.2: saved command lists replace the defaults, so
+// configs saved before a command existed lack it. The button offers whichever are missing.
+const NEW_CMDS = [
+  [/\{about\b/, { id: 'about', enabled: true, trigger: '!about', description: 'What this bot is and the version it runs', reply: '{about}', channels: [], regions: [], dm: null, cooldown_s: 30 }],
+  [/\{region_check\b/, { id: 'region', enabled: true, trigger: '!region', description: 'Whether your message carried a region', reply: '{region_check}', channels: [], regions: [], dm: null, cooldown_s: 30 }],
+  [/\{me\b/, { id: 'me', enabled: true, trigger: '!me', description: 'What this bot knows about you', reply: '{me}', channels: [], regions: [], dm: null, cooldown_s: 30 }],
+];
+const missingCmds = () => NEW_CMDS.filter(([re]) => !cfg.commands.some((m) => re.test(m.reply || ''))).map(([, c]) => c);
 function aliasField(m) {
   // Only write m.aliases once the operator adds one, so opening a card is not an edit.
   const al = Array.isArray(m.aliases) ? m.aliases : typeof m.aliases === 'string' ? m.aliases.split(',').map((x) => x.trim()).filter(Boolean) : [];
@@ -765,7 +773,9 @@ function tabCommands() {
   }
   function renderList() {
     fires.clear();
-    addAbout.hidden = cfg.commands.some((m) => /\{about\b/.test(m.reply || ''));
+    const miss = missingCmds();
+    addNew.hidden = !miss.length;
+    addNew.textContent = 'Add ' + miss.map((c) => c.trigger).join(', ');
     list.replaceChildren(...(cfg.commands.length ? cfg.commands.map(card) : [h('p', { class: 'muted', text: 'No commands defined. Add one to get started.' })]));
   }
   function refresh() { fires.forEach((f) => f()); renderBuiltins(); }
@@ -776,15 +786,15 @@ function tabCommands() {
     cfg.commands.push(m); openCmds.add(m); changed(); renderList();
     list.lastElementChild.querySelector('input').focus();
   } });
-  // Saved command lists replace the defaults, so configs saved before !about existed lack it.
-  const addAbout = h('button', { type: 'button', class: 'sm', text: 'Add the !about command', onclick: () => {
-    if (cfg.commands.some((m) => m.id === 'about' || String(m.trigger || '').trim().toLowerCase() === '!about')) {
-      toast('A command with ID "about" or trigger !about already exists. Set its reply to {about}.', true);
-      return;
-    }
-    const m = clone(ABOUT_CMD);
-    cfg.commands.push(m); openCmds.add(m); changed(); renderList();
-    toast('Added !about. Save to apply.');
+  const addNew = h('button', { type: 'button', class: 'sm', title: 'Commands new since your commands were saved', onclick: () => {
+    const taken = (c) => cfg.commands.some((m) => m.id === c.id || [m.trigger, ...(Array.isArray(m.aliases) ? m.aliases : [])]
+      .some((t) => String(t || '').trim().toLowerCase() === c.trigger));
+    const added = [], clash = [];
+    missingCmds().forEach((c) => { if (taken(c)) clash.push(c); else { cfg.commands.push(clone(c)); added.push(c.trigger); } });
+    if (added.length) { changed(); renderList(); }
+    const msg = (added.length ? 'Added ' + added.join(', ') + '. Save to apply.' : '')
+      + (clash.length ? ' ' + clash.map((c) => 'A command already uses the ID "' + c.id + '" or trigger ' + c.trigger + '; set its reply to ' + c.reply + '.').join(' ') : '');
+    toast(msg.trim(), !added.length);
   } });
 
   // test box
@@ -813,7 +823,7 @@ function tabCommands() {
   const tin = (k, lbl, o = {}) => { const el = h('input', { class: o.mono ? 'mono' : '', placeholder: o.ph, autocomplete: 'off' }); el.value = T[k]; el.addEventListener('input', () => { T[k] = el.value; }); return field(lbl, el, o.hint); };
 
   const el = h('div', {},
-    h('div', { class: 'row', style: 'margin-bottom:8px' }, h('h2', { class: 'grow', text: 'Commands' }), addAbout, add),
+    h('div', { class: 'row', style: 'margin-bottom:8px' }, h('h2', { class: 'grow', text: 'Commands' }), addNew, add),
     h('details', { class: 'card' }, h('summary', { text: 'Template reference (click a token to insert at the cursor in the reply you last edited)' }), builtins,
       h('p', { class: 'hint', style: 'margin-top:8px', text: 'Other tokens: {sender} {hops} {snr} {gateway} {region_tag} {args}. Full list in docs/TEMPLATES.md.' })),
     list,
@@ -1164,6 +1174,36 @@ const TRAFFIC_CHART = { keys: ['unscoped', 'scoped', 'unknown', 'direct'],
   colors: { unscoped: '--c2', scoped: '--c3', unknown: '--c-other', direct: '--c1' },
   names: { unscoped: 'no region', scoped: 'in a region', unknown: 'could not tell', direct: 'direct' },
   what: 'channel messages', legend: 'How messages were scoped', none: 'No messages' };
+function radioLabel(r) {
+  const cr = r.cr <= 4 ? r.cr + 4 : r.cr;
+  return (r.freq_khz / 1000).toFixed(3) + ' MHz · SF' + r.sf + ' · ' + (r.bw_hz / 1000) + ' kHz · CR 4/' + cr;
+}
+const TX_CHART = { keys: ['reply', 'follow-up', 'nudge', 'announce', 'send', 'advert'],
+  colors: { reply: '--c1', 'follow-up': '--c5', nudge: '--c2', announce: '--c3', send: '--c4', advert: '--c6' },
+  names: { reply: 'replies', 'follow-up': 'follow-ups', nudge: 'unscoped replies', announce: 'announcements', send: 'manual sends', advert: 'adverts' },
+  what: 'messages the bot sent', legend: 'What the bot sent', none: 'Nothing sent' };
+function usageAirtime(d, host) {
+  const a = d.airtime;
+  if (!a) return [];
+  const t = a.totals || {};
+  const secs = (ms) => (ms == null ? '-' : ms < 10000 ? (ms / 1000).toFixed(1) + ' s' : Math.round(ms / 1000) + ' s');
+  const pct = (v) => (v == null ? '-' : v > 0 && v < 0.01 ? '<0.01%' : v.toFixed(2) + '%');
+  const stat = (v, l) => h('div', { class: 'counter' }, h('b', { text: String(v ?? 0) }), h('span', { text: l }));
+  const radio = rt && rt.status && rt.status.radio;
+  const how = radio ? 'Estimated from each message\'s size and the companion\'s radio (' + radioLabel(radio) + ', preamble ' + radio.preamble + ').'
+    : 'Airtime is estimated once the companion has reported its radio settings.';
+  const busy = a.busiest_hour;
+  const head = h('div', { class: 'card' }, h('h2', { text: 'What the bot sent' }),
+    h('p', { class: 'hint', text: how + ' This is the bot\'s own transmission only: each repeater that forwards a flood sends it again.' + (t.unestimated ? ' ' + t.unestimated + ' sent before the radio settings were known have no estimate.' : '') }),
+    h('div', { class: 'counters' }, stat(t.sent, 'messages sent'), stat(secs(t.airtime_ms), 'on air'), stat(pct(t.share_pct), 'of the time'),
+      stat(busy ? secs(busy.airtime_ms) : '-', busy ? 'busiest hour (' + busy.label + ', ' + pct(busy.share_pct) + ')' : 'busiest hour'),
+      stat((t.failed || 0) + (t.dropped || 0), 'not sent')));
+  if (!t.sent && !t.failed && !t.dropped) return [head, h('div', { class: 'card usage-msg' }, h('b', { text: 'Nothing sent in this window.' }))];
+  return [head,
+    usageChart({ series: a.series, bucket: a.bucket, label: d.label }, host, { ...TX_CHART, title: 'Messages sent per ' + a.bucket }),
+    usageTable('By kind', [['Kind'], ['Sent', true], ['Not sent', true], ['On air', true], ['Per message', true]],
+      (a.kinds || []).map((k) => [TX_CHART.names[k.kind] || k.kind, k.sent, k.failed + k.dropped, secs(k.airtime_ms), k.sent && k.airtime_ms ? Math.round(k.airtime_ms / k.sent) + ' ms' : '-']), 'Nothing sent.')];
+}
 function usageTraffic(d, host) {
   const t = d.traffic;
   if (!t) return [];
@@ -1220,6 +1260,7 @@ function tabUsage() {
           usageTable('Channels', [['Channel'], ['Requests', true]], (d.channels || []).map((x) => [x.name, x.requests]), 'No channels.'),
           usageTable('Regions', [['Region'], ['Requests', true]], (d.regions || []).map((x) => [x.name, x.requests]), 'No regions.')));
       }
+      body.push(...usageAirtime(d, out));
       body.push(...usageTraffic(d, out));
       kids.push(h('div', { class: 'usage-data' + (USAGE.loading ? ' dim' : ''), 'aria-busy': String(USAGE.loading) }, body));
     }
@@ -1347,6 +1388,7 @@ function tabAdvanced() {
       h('div', { class: 'grid' },
         field('Companion host', textIn(cfg.companion, 'host', { mono: true })), field('Companion port', numIn(cfg.companion, 'port', { min: 1, max: 65535, step: 1 })),
         field('path_hash_bytes', numIn(cfg.node, 'path_hash_bytes', { min: 1, max: 3, step: 1 }), 'Bytes per hop hash (1 to 3). Must match the mesh.'),
+        field('Preamble (symbols)', numIn(cfg.node, 'preamble_symbols', { min: 4, max: 64, step: 1 }), 'Only for the airtime estimate on the Usage tab. Most MeshCore radios use 16.'),
         field('Log level', sel(cfg, 'log_level', ['DEBUG', 'INFO', 'WARNING', 'ERROR'].map((x) => [x, x]))))),
     h('div', { class: 'card stack' }, h('h2', { text: 'Limits' }),
       h('div', { class: 'grid' },

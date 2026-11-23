@@ -18,6 +18,8 @@ repeater, with no server.
 | `!wx <place>` | Weather forecast (off by default) |
 | `!help` | The list of commands |
 | `!about` | What the bot is and the version it runs |
+| `!region` | Whether your message carried a region, as the bot heard it |
+| `!me` | What the bot knows about you: this message's hops and SNR, your adverts, distance |
 
 You can switch each one on or off and add your own commands from the
 plugin's page in the openHop web UI.
