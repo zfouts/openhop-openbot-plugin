@@ -74,15 +74,97 @@ unscoped, `#name` scopes to that region.
 ### Commands
 
 ```json
-{"id": "path", "enabled": true, "trigger": "!path", "description": "...",
- "reply": "{path}", "channels": [], "regions": [], "dm": null, "cooldown_s": 10}
+{"id": "path", "enabled": true, "trigger": "!path", "aliases": ["!p"],
+ "description": "...", "reply": "{path}", "channels": [], "regions": [],
+ "dm": null, "cooldown_s": 10}
 ```
 
 `trigger` is matched case-insensitively against the start of the message
-text (after the sender's `name: ` prefix). Everything after the trigger is
-`{args}`. `cooldown_s` is per command, per requester, per channel/DM, and
-per region. `limits.user_cooldown_s` is a global per-requester floor across all
-commands.
+text (after the sender's `name: ` prefix), on a word boundary; the longest
+match wins. `aliases` are extra triggers for the same command: they share
+its id, cooldown and usage, and `{help}` lists only `trigger`. An alias that
+repeats any trigger or earlier alias is dropped and reported in
+`config_problems`; triggers always win over aliases. Everything after the
+matched trigger or alias is `{args}`.
+
+### Per-sender limits
+
+A request that passes scope must also pass, in order:
+
+| Limit | Key | Default | Refused as |
+|---|---|---|---|
+| Gap between one sender's commands | `limits.user_cooldown_s` | `5` | `requester cooldown` |
+| The command's own cooldown | `commands[].cooldown_s` | per command | `command cooldown` |
+| Answered commands per sender per window | `limits.user_max_requests` per `limits.user_window_s` | `8` per `600` | `requester rate limit (N per Ws)` |
+
+Limits are kept per sender identity: on a channel the sender's name,
+case-insensitively (a channel message carries nothing else); on a DM
+`dm:` and the sender's 6-byte public key prefix in hex. All three follow a
+channel sender across channels and regions. `user_max_requests` `0` turns
+the cap off; `user_window_s` is 10-86400. A reply that renders empty gives
+back what it took. Dry runs (`test`) skip these limits.
+
+### Bans
+
+```json
+"bans": [{"pattern": "^spam", "ignore_case": true, "enabled": true, "note": ""}],
+"auto_ban": {"enabled": false, "strikes": 5, "window_s": 600, "ban_h": 24}
+```
+
+A banned sender gets no command replies and no unscoped replies; the request
+is recorded as skipped (`banned (...)`) and holds no cooldown. Their messages
+still count in the roster and traffic.
+
+`bans[].pattern` is a Python regular expression searched anywhere in the
+sender's name (cut to 64 characters); anchor it (`^bob$`) to match a whole
+name. `ignore_case` and `enabled` default to `true`. A pattern that is empty,
+does not compile, or matches an empty name (so would match everyone, such as
+`spammer|`) is skipped and reported in `config_problems`, as is a `bans`
+that is not a list. Rules are numbered by their position as written
+(`ban #3`). On a DM the name is the contact's name, or the first 8 hex digits
+of its public key when the contact is unknown.
+
+With `auto_ban.enabled`, every request refused by the per-sender cap
+(`requester rate limit`) is a strike; cooldown refusals are not, since that
+is what a retry over a lossy link looks like. `strikes` (1-1000) within
+`window_s` (10-86400) bans that identity for `ban_h` hours (0.1-8760). With
+`limits.user_max_requests` `0` nothing is counted, which is reported.
+Automatic bans live in `openbot.db`, not in config; they show in
+`runtime.auto_bans` (by identity, so a DM sender is `dm:<hex>`) and end on
+their own, or with the `unban` action. The bot transmits nothing when it bans
+someone. Anyone can type any name on a channel, so a name can be banned by
+someone flooding as it; a DM identity can not.
+
+### Unscoped traffic and replies
+
+Every channel message the radio hears (the bot's own excepted) is counted
+per hour, channel and scope: a configured `#region`, `other` (scoped to a
+region not in `regions`), `*` (a plain flood), `?` (the raw frame could not
+be matched) or `direct`. Counts are kept 366 days and reported by `usage`.
+
+```json
+"nudges": [{"channel": "#chat", "enabled": true, "region": "",
+            "per_sender": 1, "per_channel": 6, "window_h": 24,
+            "text": "@[{sender}] your message had no region, ..."}]
+```
+
+A `nudges` entry turns on, for one channel, a reply to anyone heard sending
+a plain, unscoped flood there. The bot considers a reply only when the frame
+it heard was a plain flood **and** decrypts, with that channel's key, to
+exactly the message (same text and timestamp); a message it cannot verify is
+never answered. It then waits 8 seconds and sends nothing if any copy of the
+same packet carrying transport codes was heard meanwhile (or in the 2 minutes
+before), since the plain copy may be a replay or a bridge's. The key is the
+slot's `secret` or hashtag key from `channels`, or Public's well-known key;
+a channel whose key the bot does not have never gets a reply, which is
+logged once. Each sender gets at most `per_sender` (1-100) on that channel,
+and the channel at most `per_channel` (1-1000), in any `window_h` hours
+(0.1-720); both count replies queued, and one the send queue refuses is given
+back. `text` is a template, rendered with the message's context.
+`region` is where the reply is sent: `""` the companion default, `*`
+unscoped, `#name` that region. No reply goes to a banned sender, the bot
+itself, a request over `scope.max_hops`, or a protected channel: an entry for
+a protected channel is skipped and reported. One entry per channel.
 
 `reply` is a template; see [TEMPLATES.md](TEMPLATES.md). A reply that renders
 empty is not sent and does not use the cooldown.
@@ -154,10 +236,12 @@ result.
 
 | action | args | result |
 |---|---|---|
-| `test` | `text`, `channel` (or `"dm"`), `sender`, `region`, `hops` (optional hex chain) | `{"matched": "id" or null, "reply": "...", "reason": "..."}`. Never transmits. |
+| `test` | `text`, `channel` (or `"dm"`), `sender`, `region`, `hops` (optional hex chain) | `{"matched": "id" or null, "reply": "...", "reason": "..."}`, plus `"nudge": "..."` when `region` is `*` and the channel has an unscoped reply. Never transmits. |
 | `send` | `channel` (name or idx), `text`, `region` | `{"queued": true}` |
 | `announce_now` | `id` | `{"queued": true}` |
 | `clear_cooldowns` | | `{"cleared": n}` |
+| `ban_test` | `name` | `{"name": "...", "banned": "ban #1 ^spam"}`: the rule or automatic ban that applies, `""` when none. Uses the saved config. |
+| `unban` | `sender` | `{"sender": "bob", "lifted": bool}`: lifts an automatic ban and clears that sender's strikes. |
 | `provision_channels` | | `{"channels": [...]}` |
 | `usage` | `{"range": "24h"\|"7d"\|"30d"\|"90d"\|"1y"}` or `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` | The usage report below. Dates are in `node.timezone`. |
 | `advert` | `{"flood": true\|false}` (default `true`) | `{"sent": bool, "flood": bool}`. Error if the companion is not connected. |
@@ -175,8 +259,23 @@ dry runs), kept 366 days. Result:
  "requesters": [{"name": "bob", "requests": 5}],
  "channels": [{"name": "#bot", "requests": 9}],
  "regions": [{"name": "*", "requests": 9}],
- "skipped": [{"reason": "cooldown", "count": 2}]}
+ "skipped": [{"reason": "cooldown", "count": 2}],
+ "traffic": {"bucket": "hour",
+             "totals": {"scoped": 30, "unscoped": 60, "unknown": 5, "direct": 0,
+                        "messages": 95, "nudges": 2, "unscoped_pct": 66.7},
+             "series": [{"t": 1731000000.0, "label": "14:00",
+                         "counts": {"scoped": 3, "unscoped": 5, "unknown": 0, "direct": 0}}],
+             "channels": [{"name": "#chat", "scoped": 20, "unscoped": 40, "unknown": 3,
+                           "direct": 0, "nudges": 2, "messages": 63, "unscoped_pct": 66.7}],
+             "regions": [{"name": "#tx-dfw", "requests": 25},
+                         {"name": "other regions", "requests": 5}]}}
 ```
+
+Skip reasons are `banned`, `cooldown`, `rate limit`, `out of scope`,
+`empty reply` or `other`. In `traffic`, `scoped` is a configured region or
+`other`; `unscoped_pct` is unscoped over scoped plus unscoped, leaving out
+`unknown` and `direct` (`null` when both are zero). An hour that straddles
+the window's start counts in full.
 
 `bucket` is `hour` for windows up to 48 h, else `day`. An unknown range, bad
 dates, `from` after `to`, a window over 366 days, or a `from` in the future
@@ -206,11 +305,14 @@ comes back as the action's error.
                          "longitude": -97.3}]},
   "builtins": [{"name": "path", "help": "..."}],
   "commands": [{"id": "path", "fires": 3, "last_fired": 1731170000}],
+  "auto_bans": [{"sender": "bob", "since": 1731160000.0, "until": 1731246400.0,
+                 "reason": "5 refusals by the per-sender cap in 600s"}],
   "mailbox": {"processed": ["c-..."], "results": {"c-...": {"ok": true}}}
 }
 ```
 
-`activity.kind` is one of `rx`, `reply`, `skip`, `announce`, `tx`,
+`activity.kind` is one of `rx`, `reply`, `skip`, `nudge` (an unscoped
+reply), `ban` (an automatic ban began or was lifted), `announce`, `tx`,
 `error`. `activity` holds the newest 100 entries, newest last.
 `roster.recent` holds up to 50 nodes, newest first.
 

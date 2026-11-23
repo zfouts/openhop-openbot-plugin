@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 # --------------------------------------------------------------------
 # Channel secrets
@@ -130,6 +130,33 @@ def channel_hash_byte(secret: bytes) -> int:
     else:
         material = key[:32] if len(key) > 32 else key
     return hashlib.sha256(material).digest()[0]
+
+
+def group_text_plain(secret: bytes, payload: bytes) -> Optional[Tuple[int, str]]:
+    """Decrypt a GRP_TXT payload with its channel secret: ``(timestamp, text)``.
+
+    ``payload`` is channel hash (1) | MAC (2) | ciphertext. The key is the
+    secret zero-padded to 32 bytes; the MAC is HMAC-SHA256 over the
+    ciphertext with it, and AES-128-ECB uses its first 16 bytes, as in
+    openhop_core's GroupTextHandler. None when the MAC does not check out or
+    the plaintext is not plain group text.
+    """
+    if len(payload) <= 1 + CIPHER_MAC:
+        return None
+    key = bytes(secret)[:32].ljust(32, b"\x00")
+    try:
+        from openhop_core.protocol.crypto import CryptoUtils
+
+        plain = CryptoUtils.mac_then_decrypt(key[:16], key, bytes(payload[1:]))
+    except Exception:
+        return None
+    if len(plain) < 5 or plain[4] >> 2:
+        return None
+    body = plain[5:]
+    nul = body.find(b"\x00")
+    if nul >= 0:
+        body = body[:nul]
+    return int.from_bytes(plain[:4], "little"), body.decode("utf-8", errors="replace")
 
 
 def text_cipher_lengths(text_bytes: int, trailing_nul: bool = False) -> range:
@@ -257,6 +284,9 @@ ROUTE_TRANSPORT_DIRECT = _ROUTE_TRANSPORT_DIRECT
 REGION_UNSCOPED = "*"
 REGION_UNKNOWN = "?"
 REGION_DIRECT = "direct"
+# Traffic analytics only: scoped, to a region not in the configured list.
+# Scope checks still treat that as REGION_UNKNOWN and fail closed.
+SCOPE_OTHER = "other"
 
 
 def canonical_region(name: str) -> str:
@@ -305,3 +335,17 @@ def frame_region(hdr: Optional[Dict[str, Any]], keys: Dict[str, bytes]) -> str:
         if transport_code(key, hdr["payload_type"], hdr["payload"]) == codes[0]:
             return name
     return REGION_UNKNOWN
+
+
+def frame_scope(hdr: Optional[Dict[str, Any]], keys: Dict[str, bytes]) -> str:
+    """How a frame was scoped, for traffic analytics.
+
+    The same as ``frame_region`` except that a frame carrying transport codes
+    for a region not in ``keys`` is SCOPE_OTHER, not REGION_UNKNOWN: it was
+    scoped, just not to a region this node knows. REGION_UNSCOPED is only
+    ever returned for a frame that was heard as a plain flood.
+    """
+    region = frame_region(hdr, keys)
+    if region == REGION_UNKNOWN and hdr is not None and hdr.get("transport_codes"):
+        return SCOPE_OTHER
+    return region

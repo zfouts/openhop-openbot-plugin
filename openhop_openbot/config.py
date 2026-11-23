@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import re
 import site
@@ -124,6 +125,17 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         seen_ids.add(cid)
         seen_trig.add(trig.lower())
         cmds.append({**c, "id": cid, "trigger": trig, "cooldown_s": cooldown})
+    # Aliases second, so an alias can never take a later command's trigger.
+    for c in cmds:
+        aliases = []
+        for alias in _str_list(c.get("aliases")):
+            if alias.lower() in seen_trig:
+                problems.append(f"command {c['id']}: alias {alias} is already a trigger or "
+                                "alias; dropped")
+                continue
+            seen_trig.add(alias.lower())
+            aliases.append(alias)
+        c["aliases"] = aliases
     cfg["commands"] = cmds
 
     anns = []
@@ -139,6 +151,8 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
             continue
         anns.append({**a, "id": aid})
     cfg["announcements"] = anns
+
+    _validate_moderation(cfg, problems)
 
     hb = (cfg.get("node") or {}).get("path_hash_bytes")
     if hb not in (None, 1, 2, 3):
@@ -167,6 +181,136 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         problems.append(f"corescope.mpath_wait_s must be {MIN_WAIT_S}-{MAX_WAIT_S} seconds "
                         f"(got {w!r}); using {DEFAULT_WAIT_S}")
     return cfg, problems
+
+
+def _str_list(v: Any) -> List[str]:
+    """A list of non-empty strings, from a list or a comma-separated string."""
+    if isinstance(v, str):
+        v = v.split(",")
+    if not isinstance(v, (list, tuple)):
+        return []
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
+def _number(obj: Dict[str, Any], key: str, default: float, lo: float, hi: float,
+            what: str, problems: List[str], integer: bool = False) -> float:
+    """``obj[key]`` as a number in [lo, hi]; the default (with a problem) otherwise."""
+    v = obj.get(key)
+    if v is None or v == "":
+        obj[key] = default
+        return default
+    try:
+        if isinstance(v, bool):
+            raise ValueError
+        n = float(v)
+        if not math.isfinite(n) or (integer and n != int(n)):
+            raise ValueError
+    except (TypeError, ValueError):
+        n = None
+    if n is None or not lo <= n <= hi:
+        problems.append(f"{what} must be {lo:g}-{hi:g} (got {v!r}); using {default:g}")
+        n = default
+    obj[key] = int(n) if integer else n
+    return obj[key]
+
+
+def _validate_moderation(cfg: Dict[str, Any], problems: List[str]) -> None:
+    """bans, limits.user_max_requests / user_window_s, auto_ban and nudges."""
+    from .engine import moderation as mod
+    from .engine.bot import chan_norm
+
+    def section(key: str, kind: type, what: str) -> Any:
+        v = cfg.get(key)
+        if v is None and kind is list:
+            return []                   # null is as good as an empty list
+        if not isinstance(v, kind):
+            problems.append(f"{key} must be {what}; ignored")
+            return kind()
+        return v
+
+    # Every entry keeps its place, usable or not, so "ban #3" is the third
+    # entry the operator wrote; compile_bans skips the unusable ones.
+    bans = []
+    for i, b in enumerate(section("bans", list, "a list"), 1):
+        if isinstance(b, str):
+            b = {"pattern": b}
+        if not isinstance(b, dict):
+            problems.append(f"ban #{i}: not an object; skipped")
+            bans.append({"pattern": "", "enabled": False})
+            continue
+        rule = {**b, "pattern": str(b.get("pattern") or ""),
+                "ignore_case": b.get("ignore_case", True) is not False,
+                "enabled": b.get("enabled", True) is not False}
+        why = mod.rule_problem(rule)
+        if why is not None:
+            problems.append(f"ban #{i} {rule['pattern']!r}: {why}; skipped")
+        bans.append(rule)
+    cfg["bans"] = bans
+
+    limits = cfg["limits"] = dict(section("limits", dict, "an object"))
+    _number(limits, "user_max_requests", mod.USER_MAX_REQUESTS, 0, 1000,
+            "limits.user_max_requests", problems, integer=True)
+    _number(limits, "user_window_s", mod.USER_WINDOW_S, *mod.WINDOW_S_RANGE,
+            "limits.user_window_s", problems)
+
+    ab = {**mod.AUTO_BAN_DEFAULTS, **section("auto_ban", dict, "an object")}
+    ab["enabled"] = ab.get("enabled") is True
+    _number(ab, "strikes", mod.AUTO_BAN_DEFAULTS["strikes"], *mod.STRIKES_RANGE,
+            "auto_ban.strikes", problems, integer=True)
+    _number(ab, "window_s", mod.AUTO_BAN_DEFAULTS["window_s"], *mod.WINDOW_S_RANGE,
+            "auto_ban.window_s", problems)
+    _number(ab, "ban_h", mod.AUTO_BAN_DEFAULTS["ban_h"], *mod.BAN_H_RANGE,
+            "auto_ban.ban_h", problems)
+    cfg["auto_ban"] = ab
+    if ab["enabled"] and not limits.get("user_max_requests"):
+        problems.append("auto_ban counts refusals by the per-sender cap, which is off "
+                        "(limits.user_max_requests 0): nobody will be banned")
+
+    protected = {chan_norm(c) for c in _str_list((cfg.get("scope") or {}).get(
+        "protected_channels"))}
+    nudges, seen = [], set()
+    for i, n in enumerate(section("nudges", list, "a list"), 1):
+        if not isinstance(n, dict):
+            problems.append(f"nudge #{i}: not an object")
+            continue
+        ch = str(n.get("channel") or "").strip()
+        if not ch:
+            problems.append(f"nudge #{i}: no channel")
+            continue
+        if chan_norm(ch) in protected:
+            problems.append(f"nudge for {ch}: protected channel, the bot never sends there; "
+                            "skipped")
+            continue
+        if chan_norm(ch) in seen:
+            problems.append(f"nudge for {ch}: a channel can have only one; skipped")
+            continue
+        rule = {**mod.NUDGE_DEFAULTS, **n, "channel": ch,
+                "enabled": n.get("enabled", True) is not False}
+        rule["text"] = str(rule.get("text") or "").strip()
+        if not rule["text"]:
+            problems.append(f"nudge for {ch}: empty text; skipped")
+            continue
+        region = str(rule.get("region") or "").strip()
+        if region not in ("", "*"):
+            from .mesh.frames import canonical_region, region_key
+            try:
+                region_key(region)
+                region = canonical_region(region)
+            except ValueError:
+                problems.append(f"nudge for {ch}: region {region!r} has no key; using the "
+                                "companion default")
+                region = ""
+        rule["region"] = region
+        what = f"nudge for {ch}:"
+        _number(rule, "per_sender", mod.NUDGE_DEFAULTS["per_sender"], *mod.PER_SENDER_RANGE,
+                what + " per_sender", problems, integer=True)
+        _number(rule, "per_channel", mod.NUDGE_DEFAULTS["per_channel"],
+                *mod.PER_CHANNEL_RANGE, what + " per_channel", problems, integer=True)
+        _number(rule, "window_h", mod.NUDGE_DEFAULTS["window_h"], *mod.WINDOW_H_RANGE,
+                what + " window_h", problems)
+        seen.add(chan_norm(ch))
+        nudges.append(rule)
+    cfg["nudges"] = nudges
 
 
 def load(path: Path) -> Tuple[Dict[str, Any], List[str]]:

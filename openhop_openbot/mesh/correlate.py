@@ -57,15 +57,17 @@ class FrameCorrelator:
         # channel idx -> 1-byte channel hash, from the slot's key
         self.channel_hashes: Dict[int, int] = {}
 
-    def remember(self, raw: bytes, snr: float, rssi: Optional[int] = None) -> None:
+    def remember(self, raw: bytes, snr: float, rssi: Optional[int] = None
+                 ) -> Optional[TextFrame]:
+        """Buffer a text frame for ``claim``; returns it, or None for any other frame."""
         hdr = decode_frame_header(raw)
         if hdr is None or hdr["payload_type"] not in (PAYLOAD_TYPE_TXT_MSG, PAYLOAD_TYPE_GRP_TXT):
-            return
+            return None
         payload = hdr["payload"]
         # GRP_TXT: channel_hash(1) | mac(2) | cipher. TXT_MSG: dest(1) src(1) | mac(2) | cipher.
         lead = 1 if hdr["payload_type"] == PAYLOAD_TYPE_GRP_TXT else 2
         if len(payload) < lead + CIPHER_MAC:
-            return
+            return None
         self._frames.append(
             TextFrame(
                 t=time.monotonic(),
@@ -83,6 +85,7 @@ class FrameCorrelator:
         )
         while len(self._frames) > FRAME_MAX:
             self._frames.popleft()
+        return self._frames[-1] if self._frames else None
 
     def claim(self, msg: Message) -> Optional[TextFrame]:
         now = time.monotonic()

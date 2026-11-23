@@ -13,6 +13,7 @@ runs in a worker thread, and the companion reader only ever enqueues.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import copy
 import json
@@ -32,14 +33,19 @@ from .engine.builtins import BUILTINS, builtin_help
 from .engine.pathresolve import split_chain
 from .engine.schedule import Schedule
 from .engine.templates import clamp_bytes, render
-from .engine.usage import parse_window, skip_category, summarize
+from .engine.moderation import sender_key
+from .engine.usage import parse_window, skip_category, summarize, summarize_traffic
 from .mesh.companion import Advert, CompanionClient, Message
 from .mesh.correlate import FrameCorrelator, region_of
 from .mesh.frames import (
+    PAYLOAD_TYPE_GRP_TXT,
     REGION_UNKNOWN,
+    REGION_UNSCOPED,
     canonical_region,
     channel_hash_byte,
     decode_advert_frame,
+    frame_scope,
+    group_text_plain,
     hashtag_secret,
     region_key,
 )
@@ -59,6 +65,19 @@ RUNTIME_HEARTBEAT_S = 5.0
 CONTACTS_INTERVAL_S = 300
 ANNOUNCE_TICK_S = 15
 MAX_FOLLOW_UPS = 16
+# Wait this long before replying to an unscoped sender: copies of the same
+# packet keep arriving, and one that carries a region means the sender did
+# scope it (the plain copy came from a replay or a bridge). At most this many
+# wait at once.
+NUDGE_SETTLE_S = 8.0
+MAX_NUDGES_WAITING = 16
+SCOPED_SEEN_S = 120.0
+
+
+def _public_secret() -> bytes:
+    from openhop_core.companion.constants import PUBLIC_GROUP_PSK
+
+    return base64.b64decode(PUBLIC_GROUP_PSK)
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -109,6 +128,7 @@ class Hub:
         self.region_keys: Dict[str, bytes] = {}
         self._rebuild_regions()
         self.slots: Dict[int, Dict[str, Any]] = {}       # idx -> {name, ok}
+        self.channel_secrets: Dict[int, bytes] = {}      # idx -> key, for configured slots
         self._contacts: Dict[bytes, str] = {}            # 6-byte prefix -> name
         self._last_rssi: Optional[int] = None
 
@@ -127,6 +147,10 @@ class Hub:
         self._stop = asyncio.Event()
         self._ann_minute: Dict[str, str] = {}
         self._follow_ups: set = set()
+        self._nudges_waiting: set = set()
+        self.nudge_settle_s = NUDGE_SETTLE_S
+        self._scoped_seen: Dict[str, float] = {}   # packet hash -> when a scoped copy was heard
+        self._keyless_warned: set = set()
 
     # ------------------------------------------------------------ config ----
 
@@ -147,6 +171,11 @@ class Hub:
         except (OSError, ValueError) as exc:
             logger.error("config.json unreadable, keeping the last good config: %s", exc)
             self.problems = [f"config.json unreadable: {exc}"]
+            return False
+        except Exception as exc:
+            logger.error("config.json could not be validated, keeping the last good config: "
+                         "%s", exc, exc_info=True)
+            self.problems = [f"config.json could not be validated: {exc}"]
             return False
         for p in problems:
             logger.warning("config: %s", p)
@@ -238,7 +267,7 @@ class Hub:
         finally:
             self.tx.stop()
             await self.client.stop()
-            tasks += list(self._follow_ups)
+            tasks += list(self._follow_ups) + list(self._nudges_waiting)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -322,6 +351,7 @@ class Hub:
             try:
                 secret = bytes.fromhex(entry["secret"]) if entry.get("secret") \
                     else hashtag_secret(name)
+                self.channel_secrets[idx] = secret
                 self.correlator.channel_hashes[idx] = channel_hash_byte(secret)
                 ok = await self.client.set_channel(idx, name, secret)
                 logger.info("channel slot %s = %r -> %s", idx, name, "ok" if ok else "REFUSED")
@@ -364,8 +394,16 @@ class Hub:
     async def _on_raw_frame(self, raw: bytes, snr: float, rssi: int) -> None:
         self.counters["rx_frames"] += 1
         self._last_rssi = rssi
+        frame = None
         with contextlib.suppress(Exception):
-            self.correlator.remember(raw, snr, rssi)
+            frame = self.correlator.remember(raw, snr, rssi)
+        if frame is not None and frame.type == PAYLOAD_TYPE_GRP_TXT \
+                and frame.hdr.get("transport_codes"):
+            now = time.monotonic()
+            self._scoped_seen[frame.hash] = now
+            if len(self._scoped_seen) > 512:
+                self._scoped_seen = {h: t for h, t in self._scoped_seen.items()
+                                     if now - t < SCOPED_SEEN_S}
         try:
             adv = decode_advert_frame(raw)
         except Exception:
@@ -398,12 +436,18 @@ class Hub:
                               path=">".join(req.hops) or None, ts=req.ts)
         if req.hops:
             self.store.record_chain(req.hops)
+        if not req.is_dm and not self._is_me(req.sender):
+            self.store.count_traffic(req.channel, req.scope, req.heard_at)
+            await self._maybe_nudge(req)
         if not self.engine.find_command(req.text):
             return
         self.counters["commands"] += 1
         self.log_activity("rx", channel=req.channel, region=req.region, sender=req.sender,
                           text=req.text)
         result = await asyncio.to_thread(self.engine.handle, req)
+        if result.auto_banned:
+            self.log_activity("ban", channel=req.channel, region=req.region,
+                              sender=req.sender, detail=result.reason)
         if result.matched:
             answered = bool(result.reply)
             try:
@@ -468,6 +512,82 @@ class Hub:
         self.log_activity("reply", channel=req.channel, region=req.region, sender=req.sender,
                           text=text, detail="%s (follow-up)" % cid)
 
+    def _is_me(self, sender: str) -> bool:
+        me = (self.node.get("name") or "").strip().lower()
+        return bool(me) and sender.strip().lower() == me
+
+    def _secret_for(self, idx: Optional[int]) -> Optional[bytes]:
+        if idx is None:
+            return None
+        if idx in self.channel_secrets:
+            return self.channel_secrets[idx]
+        name = (self.slots.get(idx) or {}).get("name") or ""
+        if name.startswith("#"):
+            with contextlib.suppress(ValueError):
+                return hashtag_secret(name)
+        if idx == 0 and name.lower() in ("", "public"):
+            with contextlib.suppress(Exception):
+                return _public_secret()
+        return None
+
+    def _verify_unscoped(self, msg: Message, frame) -> bool:
+        """The frame is a plain flood that decrypts, with this slot's key, to
+        exactly this message: the evidence a nudge needs. The structural match
+        the correlator makes is good enough to count traffic, not to tell
+        someone their message had no region."""
+        if frame is None or msg.channel_idx is None:
+            return False
+        if frame_scope(frame.hdr, self.region_keys) != REGION_UNSCOPED:
+            return False
+        secret = self._secret_for(msg.channel_idx)
+        if secret is None:
+            if msg.channel_idx not in self._keyless_warned:
+                self._keyless_warned.add(msg.channel_idx)
+                logger.warning("unscoped replies on slot %s need its key: list the channel "
+                               "under channels with its secret", msg.channel_idx)
+                self.log_activity("error", detail="unscoped replies on slot %s need the "
+                                  "channel's key; add it under Channel slots" % msg.channel_idx)
+            return False
+        plain = group_text_plain(secret, frame.hdr.get("payload") or b"")
+        return plain is not None and plain[0] == msg.timestamp \
+            and plain[1].strip() == msg.text.strip()
+
+    async def _maybe_nudge(self, req: Request) -> None:
+        if not req.unscoped_verified:
+            return
+        if len(self._nudges_waiting) >= MAX_NUDGES_WAITING:
+            logger.info("unscoped reply to %s dropped: %d already waiting", req.sender,
+                        MAX_NUDGES_WAITING)
+            return
+        task = asyncio.ensure_future(self._nudge_later(req))
+        self._nudges_waiting.add(task)
+        task.add_done_callback(self._nudges_waiting.discard)
+
+    async def _nudge_later(self, req: Request) -> None:
+        """Reply to an unscoped sender once copies of the packet have settled,
+        unless a copy that carried a region was heard after all."""
+        if await self._sleep(self.nudge_settle_s):
+            return
+        if req.packet_hash and req.packet_hash in self._scoped_seen:
+            logger.info("no unscoped reply to %s: a copy of %s carried a region",
+                        req.sender, req.packet_hash)
+            return
+        try:
+            rule, text, row = await asyncio.to_thread(self.engine.nudge, req)
+        except Exception as exc:
+            logger.error("unscoped reply failed: %s", exc, exc_info=True)
+            return
+        if rule is None:
+            return
+        text = clamp_bytes(text)
+        if not self.tx.put(TxJob(text=text, channel_idx=req.channel_idx,
+                                 scope=self.scope_for(str(rule.get("region") or "")),
+                                 label="nudge:%s" % req.channel)):
+            self.store.drop_nudge(row)      # not sent, so it does not count
+            return
+        self.log_activity("nudge", channel=req.channel, region=req.region,
+                          sender=req.sender, text=text)
+
     def _request_from(self, msg: Message) -> Optional[Request]:
         frame = self.correlator.claim(msg)
         # When the radio heard it: the frame's receive time (monotonic) moved
@@ -501,10 +621,13 @@ class Hub:
         channel = slot["name"] if slot else str(msg.channel_idx)
         if msg.channel_idx == 0 and not slot:
             channel = "Public"
+        scope = frame_scope(frame.hdr if frame else None, self.region_keys)
+        verified = (scope == REGION_UNSCOPED and self.engine.nudge_rule(channel) is not None
+                    and self._verify_unscoped(msg, frame))
         return Request(sender=sender, text=body, channel=channel, channel_idx=msg.channel_idx,
                        region=region, hops_n=hops_n, hops=hops, hash_size=hash_size, snr=snr,
                        rssi=rssi, ts=msg.timestamp, packet_hash=frame.hash if frame else None,
-                       heard_at=heard_at)
+                       heard_at=heard_at, scope=scope, unscoped_verified=verified)
 
     # ---------------------------------------------------------- transmit ----
 
@@ -636,7 +759,13 @@ class Hub:
             tz = (self.cfg.get("node") or {}).get("timezone") or "America/Chicago"
             window = parse_window(args, time.time(), tz)
             rows = await asyncio.to_thread(self.store.usage_rows, window["from"], window["to"])
-            return summarize(rows, window, tz, self.engine.commands())
+            out = summarize(rows, window, tz, self.engine.commands())
+            traffic = await asyncio.to_thread(self.store.traffic_rows, window["from"],
+                                              window["to"])
+            nudges = await asyncio.to_thread(self.store.nudge_rows, window["from"],
+                                             window["to"])
+            out["traffic"] = summarize_traffic(traffic, nudges, window, tz)
+            return out
         if action == "advert":
             flood = args.get("flood", True)
             if not isinstance(flood, bool):
@@ -665,6 +794,20 @@ class Hub:
             return {"queued": await asyncio.to_thread(self._announce, ann)}
         if action == "clear_cooldowns":
             return {"cleared": self.store.clear_fires()}
+        if action == "ban_test":
+            name = str(args.get("name") or "").strip()
+            if not name:
+                raise ValueError("give a name to test")
+            return {"name": name,
+                    "banned": await asyncio.to_thread(self.engine.ban_reason, name)}
+        if action == "unban":
+            sender = sender_key(args.get("sender"))
+            if not sender:
+                raise ValueError("give the sender to unban")
+            lifted = self.store.lift_auto_ban(sender)
+            if lifted:
+                self.log_activity("ban", sender=sender, detail="automatic ban lifted")
+            return {"sender": sender, "lifted": lifted}
         if action == "provision_channels":
             if not self.client.is_connected():
                 raise ValueError("companion not connected")
@@ -691,9 +834,14 @@ class Hub:
             hops=hops, hash_size=hash_size, snr=args.get("snr"),
         )
         res = self.engine.handle(req, dry_run=True)
-        return {"matched": res.matched, "reply": res.reply, "extra": res.extra,
-                "reason": res.reason,
-                "bytes": len(res.reply.encode("utf-8"))}
+        out = {"matched": res.matched, "reply": res.reply, "extra": res.extra,
+               "reason": res.reason,
+               "bytes": len(res.reply.encode("utf-8"))}
+        if req.region == REGION_UNSCOPED:
+            nudge = self.engine.nudge_preview(req)
+            if nudge:
+                out["nudge"] = clamp_bytes(nudge)
+        return out
 
     # ----------------------------------------------------------- runtime ----
 
@@ -729,6 +877,7 @@ class Hub:
                        "recent": recent},
             "builtins": builtin_help(),
             "commands": [{"id": k, **v} for k, v in self.cmd_stats.items()],
+            "auto_bans": self.store.auto_bans(),
             "mailbox": {"processed": list(self.mailbox_done),
                         "results": copy.deepcopy(self.mailbox_results)},
         }

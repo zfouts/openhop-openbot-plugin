@@ -127,12 +127,14 @@ def test_ignores_own_messages():
 
 # ------------------------------------------------------------ cooldowns ----
 
-def test_cooldown_per_requester_channel_region():
+def test_cooldown_follows_the_requester_across_channels_and_regions():
     eng, _ = make()
     assert eng.handle(req(), now=1000).reply
     assert eng.handle(req(), now=1005).reason == "command cooldown"
     assert eng.handle(req(sender="alice"), now=1005).reply
-    assert eng.handle(req(region="#x"), now=1005).reply
+    assert eng.handle(req(region="#x"), now=1005).reason == "command cooldown"
+    assert eng.handle(req(channel="dm", channel_idx=None), now=1005).reason == "command cooldown"
+    assert eng.handle(req(sender="BOB"), now=1005).reason == "command cooldown"
     assert eng.handle(req(), now=1011).reply
 
 
