@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "openhop.openbot",
   "name": "OpenBot",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Standalone MeshCore command bot: !path, !seen, !wx and your own commands, scoped by channel and region, with optional CoreScope map links and !mpath.",
   "runtime": {
     "type": "python",
@@ -199,6 +199,16 @@
         "shortener_url": "",
         "shortener_key": "",
         "mpath_wait_s": 30
+      },
+      "notify": {
+        "targets": [],
+        "events": {
+          "update": false,
+          "ignored": false,
+          "started": false,
+          "problems": false
+        },
+        "max_per_hour": 6
       }
     }
   },

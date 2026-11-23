@@ -82,11 +82,13 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
 
     chans = []
     seen_idx = set()
-    for ch in cfg.get("channels") or []:
+    for i, ch in enumerate(cfg.get("channels") or [], 1):
         try:
             idx = int(ch.get("idx"))
         except (TypeError, ValueError, AttributeError):
-            problems.append(f"channel {ch!r}: idx must be a number")
+            # Name the entry, never print it: it may carry a private channel's secret.
+            label = (str(ch.get("name") or "").strip() if isinstance(ch, dict) else "") or f"#{i}"
+            problems.append(f"channel {label}: idx must be a number")
             continue
         name = str(ch.get("name") or "").strip()
         secret = str(ch.get("secret") or "").strip()
@@ -153,6 +155,7 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     cfg["announcements"] = anns
 
     _validate_moderation(cfg, problems)
+    _validate_notify(cfg, problems)
 
     hb = (cfg.get("node") or {}).get("path_hash_bytes")
     if hb not in (None, 1, 2, 3):
@@ -316,6 +319,83 @@ def _validate_moderation(cfg: Dict[str, Any], problems: List[str]) -> None:
         seen.add(chan_norm(ch))
         nudges.append(rule)
     cfg["nudges"] = nudges
+
+
+def _validate_notify(cfg: Dict[str, Any], problems: List[str]) -> None:
+    """notify: targets (channel slots or admin DMs by public key), the event
+    switches and the hourly cap. Bad targets are reported and skipped."""
+    from .engine.bot import chan_norm
+    from .engine.notify import EVENTS, MAX_PER_HOUR, MAX_PER_HOUR_RANGE
+    from .mesh.frames import canonical_region, region_key
+
+    n = cfg.get("notify")
+    if n is None:
+        n = {}
+    elif not isinstance(n, dict):
+        problems.append("notify must be an object; ignored")
+        n = {}
+    protected = {chan_norm(c) for c in _str_list((cfg.get("scope") or {}).get(
+        "protected_channels"))}
+    raw = n.get("targets")
+    if raw is not None and not isinstance(raw, list):
+        problems.append("notify.targets must be a list; ignored")
+        raw = []
+    targets, seen = [], set()
+    for i, t in enumerate(raw or [], 1):
+        kind = t.get("kind") if isinstance(t, dict) else None
+        if kind == "channel":
+            ch = str(t.get("channel") or "").strip()
+            if not ch:
+                problems.append(f"notify target #{i}: no channel; skipped")
+                continue
+            if ch.isdigit():
+                problems.append(f"notify target #{i}: channel must be a slot name, not a "
+                                "number; skipped")
+                continue
+            if chan_norm(ch) in protected:
+                problems.append(f"notify target {ch}: protected channel, the bot never sends "
+                                "there; skipped")
+                continue
+            region = str(t.get("region") or "").strip()
+            if region not in ("", "*"):
+                try:
+                    region_key(region)
+                    region = canonical_region(region)
+                except ValueError:
+                    problems.append(f"notify target {ch}: region {region!r} has no key; using "
+                                    "the companion default")
+                    region = ""
+            key = ("channel", chan_norm(ch))
+            entry = {"kind": "channel", "channel": ch, "region": region}
+        elif kind == "dm":
+            pk = str(t.get("pubkey") or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", pk):
+                problems.append(f"notify target #{i}: admin key {pk[:16]!r} must be the "
+                                "contact's full 64-hex public key; skipped")
+                continue
+            name = str(t.get("name") or "").strip()[:32]
+            key = ("dm", pk)
+            entry = {"kind": "dm", "pubkey": pk, "name": name}
+        else:
+            problems.append(f"notify target #{i}: kind must be channel or dm (got "
+                            f"{kind if isinstance(t, dict) else t!r}); skipped")
+            continue
+        if key in seen:
+            problems.append(f"notify target #{i}: listed twice; skipped")
+            continue
+        seen.add(key)
+        targets.append(entry)
+    ev = n.get("events") if isinstance(n.get("events"), dict) else {}
+    out = {"targets": targets, "events": {e: ev.get(e) is True for e in EVENTS},
+           "max_per_hour": n.get("max_per_hour")}
+    _number(out, "max_per_hour", MAX_PER_HOUR, *MAX_PER_HOUR_RANGE, "notify.max_per_hour",
+            problems, integer=True)
+    if out["max_per_hour"] < len(targets):
+        problems.append(f"notify.max_per_hour ({out['max_per_hour']}) is below the number of "
+                        f"targets; each notification goes to all {len(targets)}, so using "
+                        f"{len(targets)}")
+        out["max_per_hour"] = len(targets)
+    cfg["notify"] = out
 
 
 def load(path: Path) -> Tuple[Dict[str, Any], List[str]]:

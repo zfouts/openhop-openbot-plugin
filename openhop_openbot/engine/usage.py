@@ -233,7 +233,7 @@ def summarize_traffic(rows: Sequence[Mapping[str, Any]], nudges: Sequence[Mappin
     }
 
 
-TX_KINDS = ("reply", "follow-up", "nudge", "announce", "send", "advert")
+TX_KINDS = ("reply", "follow-up", "nudge", "announce", "send", "advert", "notify")
 
 
 def summarize_airtime(rows: Sequence[Mapping[str, Any]], window: Mapping[str, Any],

@@ -24,10 +24,11 @@ const DEFAULTS = {
   commands: [], announcements: [],
   weather: { units: 'auto', default_country: 'us', contact: '' },
   corescope: { enabled: false, base_url: '', shortener: 'v.gd', shortener_url: '', shortener_key: '', mpath_wait_s: 30 },
+  notify: { targets: [], events: { update: false, ignored: false, started: false, problems: false }, max_per_hour: 6 },
 };
 
 const TABS = [
-  ['status', 'Status'], ['commands', 'Commands'], ['scope', 'Scope & Regions'], ['moderation', 'Moderation'], ['announce', 'Announcements'],
+  ['status', 'Status'], ['commands', 'Commands'], ['scope', 'Scope & Regions'], ['moderation', 'Moderation'], ['announce', 'Announcements'], ['notify', 'Notifications'],
   ['weather', 'Weather'], ['send', 'Send'], ['activity', 'Activity'], ['usage', 'Usage'], ['nodes', 'Nodes'],
   ['corescope', 'CoreScope'], ['advanced', 'Advanced'],
 ];
@@ -275,6 +276,24 @@ function validate() {
   if ((c.corescope.enabled || c.corescope.base_url) && !/^https?:\/\/[^\/\s]+/.test(c.corescope.base_url || '')) e.push('CoreScope base URL must start with http:// or https://');
   if (c.corescope.shortener === 'custom' && !/^https:\/\/[^\/\s?#]+[^\s?#]*$/.test(c.corescope.shortener_url || '')) e.push('Custom shortener URL must be an https:// address');
   num(c.corescope.mpath_wait_s, '!mpath wait', 5, 300);
+  const nseen = new Set();
+  c.notify.targets.forEach((t, i) => {
+    const n = 'Notification target ' + (i + 1);
+    if (t.kind === 'channel') {
+      const k = chanNorm(t.channel);
+      if (!k) e.push(n + ': pick a channel');
+      else if (prot.has(k)) e.push(n + ': ' + t.channel + ' is protected; the bot never sends there');
+      else if (nseen.has('c:' + k)) e.push(n + ': ' + t.channel + ' is listed twice');
+      nseen.add('c:' + k);
+      if (String(t.region || '').trim().startsWith('$')) e.push(n + ': region must be empty, * or a region name');
+    } else if (t.kind === 'dm') {
+      if (!/^[0-9a-f]{64}$/i.test(String(t.pubkey || ''))) e.push(n + ': pick the admin from the contact list');
+      else if (nseen.has('d:' + t.pubkey.toLowerCase())) e.push(n + ': ' + (t.name || 'admin') + ' is listed twice');
+      nseen.add('d:' + String(t.pubkey).toLowerCase());
+    }
+  });
+  num(c.notify.max_per_hour, 'Notifications per hour', 1, 60, true);
+  if (c.notify.max_per_hour < c.notify.targets.length) e.push('Notifications per hour must be at least the number of targets (' + c.notify.targets.length + '): each notification goes to all of them');
   if (c.weather.default_country && !/^[A-Za-z]{2}$/.test(c.weather.default_country)) e.push('Default country must be a 2-letter code such as us, gb or de');
   if (c.node.latitude != null) num(c.node.latitude, 'Latitude', -90, 90);
   if (c.node.longitude != null) num(c.node.longitude, 'Longitude', -180, 180);
@@ -1287,6 +1306,135 @@ function tabAnnounce() {
     list, datalist('dl-ch', channelNames()), datalist('dl-rg', ['*', ...regionNames()])) };
 }
 
+// ---------------------------------------------------------------- tab: notifications
+const NOTIFY_EVENTS = [
+  ['update', 'A new version is out', 'Checks GitHub every 6 hours while this is on, the same check as the update button, and tells you once per new version.'],
+  ['ignored', 'Someone was ignored', 'A banned sender\'s command was ignored, or an automatic ban began. Once per sender per day, and at most 3 an hour.'],
+  ['started', 'The bot started', 'When the bot starts or restarts, with the version it runs. Handy to confirm an update took.'],
+  ['problems', 'Something needs attention', 'New config problems after a save (how many, not what they say), the CoreScope region list failing 3 times running, or 3 messages failing to send within 10 minutes. Each kind at most every 6 hours.'],
+];
+function tabNotify() {
+  const n = cfg.notify;
+  const contacts = () => (rt && Array.isArray(rt.contacts) ? rt.contacts : []);
+  const contactFor = (pk) => contacts().find((c) => String(c.pubkey).toLowerCase() === String(pk).toLowerCase());
+  const summary = h('p', { class: 'summary-line' });
+  const updLine = h('p', { class: 'hint' });
+  const list = h('div', { class: 'stack' });
+  const picker = h('div', { class: 'row', hidden: true });
+  const openChannels = () => channelNames().filter((c) => !cfg.scope.protected_channels.map(chanNorm).includes(chanNorm(c)));
+
+  const describe = () => {
+    const on = NOTIFY_EVENTS.filter(([k]) => n.events[k]).map(([, label]) => label.toLowerCase());
+    const where = n.targets.map((t) => (t.kind === 'dm' ? (t.name || 'an admin') + ' (DM)' : t.channel)).filter(Boolean);
+    if (!where.length && !on.length) return 'Off. Add somewhere to send notifications, then pick what to send.';
+    if (!where.length) return 'Off until you add somewhere to send them.';
+    if (!on.length) return 'Off until you turn on at least one kind below.';
+    return 'Sends to ' + listText(where) + ' when: ' + listText(on) + '. At most ' + plural(n.max_per_hour, 'message') + ' on the air an hour.';
+  };
+  const sync = () => {
+    summary.textContent = describe();
+    test.disabled = !n.targets.length;
+    test.title = n.targets.length ? '' : 'Add somewhere to send notifications first.';
+    showUpdate();                       // declared below; sync only runs after it is
+  };
+
+  const updateText = () => {
+    const u = rt && rt.update;
+    if (!n.events.update) return 'Off: the bot does not check for updates.';
+    if (!u) return 'The bot reports its update check once it is running this version.';
+    if (u.error) return 'Last update check failed' + (u.checked_at ? ' ' + ago(u.checked_at) : '') + ': ' + u.error;
+    if (!u.checked_at) return 'The bot checks for updates a minute after it starts.';
+    if (u.available) return 'OpenBot ' + u.latest + ' is out (running ' + u.running + '), checked ' + ago(u.checked_at) + '.';
+    return 'Up to date: ' + (u.latest ? 'the latest release is ' + u.latest + ', ' : '') + 'checked ' + ago(u.checked_at) + '.';
+  };
+
+  const renderList = () => {
+    list.replaceChildren(...(n.targets.length ? n.targets.map((t, i) => {
+      const remove = h('button', { type: 'button', class: 'sm danger', text: 'Remove', 'aria-label': 'Remove notification target ' + (i + 1),
+        onclick: () => { n.targets.splice(i, 1); changed(); renderList(); sync(); } });
+      if (t.kind === 'dm') {
+        const known = !!contactFor(t.pubkey);
+        const live = rt && Array.isArray(rt.contacts);
+        return h('div', { class: 'row target' },
+          h('span', { class: 'pill', text: 'DM' }),
+          h('span', { class: 'grow' }, h('b', { text: t.name || 'admin' }), ' ', h('span', { class: 'mono muted small', text: String(t.pubkey).slice(0, 12) })),
+          live ? h('span', { class: 'pill ' + (known ? 'ok' : 'warn'), text: known ? 'contact' : 'not a contact',
+            title: known ? 'The companion can reach them.' : 'The companion does not have them as a contact, so DMs cannot be sent. Ask them to advertise.' }) : null,
+          remove);
+      }
+      const ch = h('select', { 'aria-label': 'Channel for notification target ' + (i + 1) },
+        [...new Set([...openChannels(), t.channel].filter(Boolean))].map((c) => h('option', { value: c, text: c })));
+      ch.value = t.channel || '';
+      ch.addEventListener('change', () => { t.channel = ch.value; changed(); sync(); });
+      return h('div', { class: 'row target' },
+        h('span', { class: 'pill', text: 'Channel' }),
+        h('label', { class: 'field grow' }, h('span', { class: 'lbl', text: 'Channel' }), ch),
+        field('Send in region', textIn(t, 'region', { mono: true, list: 'dl-ntf-rg', ph: 'companion default' }), null, 'region-in'),
+        remove);
+    }) : [h('p', { class: 'muted', text: 'Nowhere yet.' })]));
+  };
+
+  const addChannel = h('button', { type: 'button', text: 'Add a channel', onclick: () => {
+    const used = new Set(n.targets.filter((t) => t.kind === 'channel').map((t) => chanNorm(t.channel)));
+    const ch = openChannels().find((c) => !used.has(chanNorm(c)));
+    if (!ch) { toast(openChannels().length ? 'Every channel slot is already listed.' : 'Add a channel slot on the Scope & Regions tab first.', true); return; }
+    n.targets.push({ kind: 'channel', channel: ch, region: '' }); changed(); renderList(); sync();
+  } });
+  const addAdmin = h('button', { type: 'button', text: 'Add an admin', onclick: () => {
+    const taken = new Set(n.targets.filter((t) => t.kind === 'dm').map((t) => String(t.pubkey).toLowerCase()));
+    const opts = contacts().filter((c) => !taken.has(String(c.pubkey).toLowerCase()));
+    if (!opts.length) {
+      toast(contacts().length ? 'Every contact is already listed.' : 'The companion has no contacts yet. Ask the admin to advertise, then try again.', true);
+      return;
+    }
+    const sel = h('select', { 'aria-label': 'Admin to notify' }, opts.map((c) => h('option', { value: c.pubkey, text: (c.name || '(no name)') + '  ' + String(c.pubkey).slice(0, 8) })));
+    picker.replaceChildren(h('label', { class: 'field grow' }, h('span', { class: 'lbl', text: 'Admin (from the companion\'s contacts)' }), sel),
+      h('button', { type: 'button', class: 'primary', text: 'Add', onclick: () => {
+        const c = opts.find((x) => x.pubkey === sel.value);
+        if (c) { n.targets.push({ kind: 'dm', pubkey: String(c.pubkey).toLowerCase(), name: String(c.name || '').slice(0, 32) }); changed(); renderList(); sync(); }
+        picker.hidden = true;
+      } }),
+      h('button', { type: 'button', text: 'Cancel', onclick: () => { picker.hidden = true; } }));
+    picker.hidden = false; sel.focus();
+  } });
+
+  const test = h('button', { type: 'button', text: 'Send a test notification', onclick: async () => {
+    test.disabled = true; test.textContent = 'Sending…';
+    const r = await runAction('notify_test', {});
+    test.textContent = 'Send a test notification'; sync();
+    if (!r) return;
+    const res = r.result;
+    if (!res) toast('Asked the bot; no answer yet. Is it running?', true);
+    else if (!res.ok) toast(res.error || 'Nothing was sent.', true);
+    else toast('Queued for ' + plural(res.sent, 'target') + '.' + (res.failed && res.failed.length ? ' Not sent: ' + res.failed.join('; ') : ''), !!(res.failed && res.failed.length));
+  } });
+
+  const showUpdate = () => { updLine.textContent = updateText(); updLine.classList.toggle('mark', !!(n.events.update && rt && rt.update && rt.update.available)); };
+  renderList(); sync(); showUpdate();
+  const recent = h('div');
+  const renderRecent = () => {
+    const items = ((rt && rt.activity) || []).filter((a) => a.kind === 'notify').slice(-5).reverse();
+    recent.replaceChildren(items.length
+      ? h('ul', { class: 'plain' }, items.map((a) => h('li', {}, h('span', { class: 'muted small', text: ago(a.ts) + ' · ' + (a.detail || '') + ' · ' }), a.text || '')))
+      : h('p', { class: 'muted', text: 'None sent since the bot started.' }));
+  };
+  renderRecent();
+
+  return { el: h('div', {},
+    h('div', { class: 'card stack' }, h('h2', { text: 'Operator notifications' }), summary,
+      h('p', { class: 'hint', text: 'The bot can tell you on a channel or by DM when something needs you, so you don\'t have to log in to find out. Every message costs airtime like any other, so these are off until you choose.' })),
+    h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Send to' }), addChannel, addAdmin),
+      h('p', { class: 'hint', text: 'Everyone on a channel sees what is sent there, so use a private channel slot (one with a secret) for notices only operators should read. DMs reach contacts the companion knows; an admin who has not advertised cannot get them.' }),
+      list, picker, datalist('dl-ntf-rg', ['*', ...regionNames()])),
+    h('div', { class: 'card stack' }, h('h2', { text: 'What to send' }),
+      h('div', { class: 'checks' }, NOTIFY_EVENTS.map(([k, label, hint]) => h('div', { class: 'event' },
+        check(label, n.events, k, { onchange: sync }), h('small', { class: 'hint', text: hint }),
+        k === 'update' ? updLine : null))),
+      field('At most, per hour', numIn(n, 'max_per_hour', { min: 1, max: 60, step: 1, onchange: sync }), '1 to 60 messages on the air, across every kind: one notification to 3 targets counts 3. Extra ones are dropped, not queued.', 'narrow')),
+    h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Recently sent' }), test), recent)),
+  refresh: () => { showUpdate(); renderRecent(); } };
+}
+
 // ---------------------------------------------------------------- tab: weather
 function tabWeather() {
   const w = cfg.weather, node = cfg.node;
@@ -1439,9 +1587,9 @@ function radioLabel(r) {
   const cr = r.cr <= 4 ? r.cr + 4 : r.cr;
   return (r.freq_khz / 1000).toFixed(3) + ' MHz · SF' + r.sf + ' · ' + (r.bw_hz / 1000) + ' kHz · CR 4/' + cr;
 }
-const TX_CHART = { keys: ['reply', 'follow-up', 'nudge', 'announce', 'send', 'advert'],
-  colors: { reply: '--c1', 'follow-up': '--c5', nudge: '--c2', announce: '--c3', send: '--c4', advert: '--c6' },
-  names: { reply: 'replies', 'follow-up': 'follow-ups', nudge: 'unscoped replies', announce: 'announcements', send: 'manual sends', advert: 'adverts' },
+const TX_CHART = { keys: ['reply', 'follow-up', 'nudge', 'announce', 'send', 'advert', 'notify'],
+  colors: { reply: '--c1', 'follow-up': '--c5', nudge: '--c2', announce: '--c3', send: '--c4', advert: '--c6', notify: '--c-other' },
+  names: { reply: 'replies', 'follow-up': 'follow-ups', nudge: 'unscoped replies', announce: 'announcements', send: 'manual sends', advert: 'adverts', notify: 'notifications' },
   what: 'messages the bot sent', legend: 'What the bot sent', none: 'Nothing sent' };
 function usageAirtime(d, host) {
   const a = d.airtime;
@@ -1541,7 +1689,7 @@ function tabUsage() {
 // ---------------------------------------------------------------- tab: activity / nodes
 const actFilter = new Set();
 function tabActivity() {
-  const KINDS = ['rx', 'reply', 'skip', 'nudge', 'ban', 'announce', 'alert', 'tx', 'error'];
+  const KINDS = ['rx', 'reply', 'skip', 'nudge', 'ban', 'notify', 'announce', 'alert', 'tx', 'error'];
   const log = h('div', { class: 'log', role: 'log', 'aria-label': 'Activity log' });
   const filters = h('div', { class: 'row' }, h('span', { class: 'muted', text: 'Show:' }), KINDS.map((k) => {
     const cb = h('input', { type: 'checkbox', checked: !actFilter.size || actFilter.has(k) });
@@ -1666,7 +1814,7 @@ function tabAdvanced() {
 }
 
 // ---------------------------------------------------------------- shell
-const BUILDERS = { status: tabStatus, commands: tabCommands, scope: tabScope, moderation: tabModeration, announce: tabAnnounce, weather: tabWeather, send: tabSend, activity: tabActivity, usage: tabUsage, nodes: tabNodes, corescope: tabCoreScope, advanced: tabAdvanced };
+const BUILDERS = { status: tabStatus, commands: tabCommands, scope: tabScope, moderation: tabModeration, announce: tabAnnounce, notify: tabNotify, weather: tabWeather, send: tabSend, activity: tabActivity, usage: tabUsage, nodes: tabNodes, corescope: tabCoreScope, advanced: tabAdvanced };
 
 function renderTabs() {
   const nav = $('#tabs');

@@ -192,6 +192,34 @@ empty is not sent and does not use the cooldown.
 `schedule` is a 5-field cron expression in `node.timezone`, or
 `every <seconds>`.
 
+### Operator notifications
+
+```json
+"notify": {
+  "targets": [{"kind": "channel", "channel": "#ops", "region": ""},
+              {"kind": "dm", "pubkey": "<64 hex>", "name": "zach"}],
+  "events": {"update": false, "ignored": false, "started": false, "problems": false},
+  "max_per_hour": 6
+}
+```
+
+Off until there is a target and an event is on. A `channel` target is a
+configured slot (hashtag or private), never a protected channel; `region` as
+for announcements. A `dm` target is a companion contact by full public key;
+the bot can only DM contacts the companion has, and reports the ones it
+can't. Each event goes to every target as one message clamped to 160 bytes,
+through the TX queue (kind `notify`). `max_per_hour` (1-60, at least the
+number of targets) caps frames on the air across every event: one event to
+three targets counts three, and an event goes to every target or none. Extra
+ones are dropped. Events:
+
+| Event | When | Repeats |
+|---|---|---|
+| `update` | GitHub's newest stable release with a wheel (the repository in openHop's `state.json`, else `zfouts/openhop-openbot-plugin`) is newer than the running version. Checked only while `update` is on: from 1 minute after start, every 6 hours (1 hour after a failure), with a plain `openhop-openbot/<version>` User-Agent. Found while the companion is down, it is sent once it reconnects. | Once per version; remembered in `data/notify_state.json` once queued |
+| `ignored` | A banned sender's command was ignored, or an automatic ban began | Once per sender (DM senders by key) per 24 hours, and at most 3 events an hour |
+| `started` | The first companion connection after the bot starts | Once per run |
+| `problems` | New config problems after a save (the count only: problem text can quote config); CoreScope's region list failing 3 times in a row; 3 transmissions failing within 10 minutes (notifications themselves excluded) | Once per kind per 6 hours |
+
 ### CoreScope
 
 ```json
@@ -256,6 +284,7 @@ result.
 | `ban_test` | `name` | `{"name": "...", "banned": "ban #1 ^spam"}`: the rule or automatic ban that applies, `""` when none. Uses the saved config. |
 | `unban` | `sender` | `{"sender": "bob", "lifted": bool}`: lifts an automatic ban and clears that sender's strikes. |
 | `provision_channels` | | `{"channels": [...]}` |
+| `notify_test` | | `{"sent": n, "failed": ["zach: not a contact ..."]}`. A test message to every target, whatever the event switches; error when nothing could be sent. |
 | `corescope_regions` | | `{"regions": n, "partial": null \| "why"}`. Fetches CoreScope's region list now (`/api/scope-stats?window=7d` and `/api/scope-audit?window=1h`) and caches it in `data/corescope_regions.json`. Error when CoreScope is off or the stats fetch fails; `partial` is set when only the repeater counts failed. The bot also fetches on start and every 6 hours. |
 | `usage` | `{"range": "24h"\|"7d"\|"30d"\|"90d"\|"1y"}` or `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` | The usage report below. Dates are in `node.timezone`. |
 | `advert` | `{"flood": true\|false}` (default `true`) | `{"sent": bool, "flood": bool}`. Error if the companion is not connected. |
@@ -358,6 +387,10 @@ comes back as the action's error.
   "commands": [{"id": "path", "fires": 3, "last_fired": 1731170000}],
   "auto_bans": [{"sender": "bob", "since": 1731160000.0, "until": 1731246400.0,
                  "reason": "5 refusals by the per-sender cap in 600s"}],
+  "update": {"running": "1.7.0", "latest": "1.7.0", "url": "https://github.com/...",
+             "available": false, "checked_at": 1731170000, "error": null},
+  "contacts": [{"name": "zach", "pubkey": "<64 hex>"}],
+  "notify": {"sent": 3, "dropped": 0},
   "mailbox": {"processed": ["c-..."], "results": {"c-...": {"ok": true}}}
 }
 ```
@@ -370,8 +403,11 @@ the bot tests packets against. `corescope.regions` is empty when CoreScope is
 off or the cached list came from another base URL.
 
 `activity.kind` is one of `rx`, `reply`, `skip`, `nudge` (an unscoped
-reply), `ban` (an automatic ban began or was lifted), `announce`, `tx`,
-`error`. `activity` holds the newest 100 entries, newest last.
+reply), `ban` (an automatic ban began or was lifted), `notify` (an operator
+notification was queued), `announce`, `tx`, `error`. `contacts` is the
+companion's contact list (up to 300), for picking notification admins.
+`update` is the bot's own release check; `notify` counts notifications sent
+and dropped by the hourly cap since start. `activity` holds the newest 100 entries, newest last.
 `roster.recent` holds up to 50 nodes, newest first.
 
 ## Updates (openHop's API, not the bot)
