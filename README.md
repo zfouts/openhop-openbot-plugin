@@ -34,6 +34,7 @@ plugin's page in the openHop web UI.
 - Channel traffic by region: how much of each channel's traffic has no region
 - Optional, rate-limited replies telling senders their message had no region
 - Scheduled announcements
+- Operator notifications by channel or DM: a new release is out, someone was ignored, the bot started, or something needs attention
 - Usage charts for each command, user, channel and region
 - One-click updates from GitHub releases
 

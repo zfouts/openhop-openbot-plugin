@@ -36,6 +36,7 @@ from .engine.pathresolve import split_chain
 from .engine.schedule import Schedule
 from .engine.templates import clamp_bytes, render
 from .engine.moderation import sender_key
+from .engine.notify import Notifier
 from .engine.usage import (
     parse_window,
     skip_category,
@@ -64,6 +65,7 @@ from .mesh.txqueue import EXTRA_GAP_S, TxJob, TxQueue
 from .services.geocode import Geocoder
 from .services.openmeteo import OpenMeteo
 from .services.corescope import CoreScope, CoreScopeError, region_name
+from .services.github import GitHubError, latest_release, newer, repository
 from .services.shortener import DEFAULT as DEFAULT_SHORTENER
 from .services.shortener import make_shortener
 from .store import Store
@@ -89,6 +91,14 @@ CS_REGIONS_EVERY_S = 6 * 3600
 CS_REGIONS_RETRY_S = 15 * 60
 CS_REGIONS_TICK_S = 60.0
 CS_REGIONS_MAX = 200
+# Operator notifications (engine/notify.py).
+UPDATE_EVERY_S = 6 * 3600
+UPDATE_FIRST_S = 60.0           # first check this long after start
+IGNORED_EVERY_S = 24 * 3600     # per sender
+PROBLEM_EVERY_S = 6 * 3600      # per kind of problem
+TX_FAIL_N, TX_FAIL_WINDOW_S = 3, 600.0
+CS_FAIL_N = 3
+CONTACTS_MAX = 300
 
 
 def _public_secret() -> bytes:
@@ -138,7 +148,20 @@ class Hub:
         self._cs_last: Optional[tuple] = None             # (ok, result or error) of the last one
         self.node: Dict[str, Any] = {"started_at": self.started_at}
         self.engine = Engine(self.cfg, self.store, node=self.node)
+        self.user_agent = "openhop-openbot/%s" % __version__
         self._build_services()
+
+        self.notifier = Notifier(self._send_notify)
+        self.notifier.configure(self.cfg.get("notify") or {})
+        self.notify_state_path = data_dir / "notify_state.json"
+        self.notify_state: Dict[str, Any] = self._load_notify_state()
+        self.update_info: Dict[str, Any] = {"running": __version__, "latest": None, "url": None,
+                                            "available": False, "checked_at": None,
+                                            "error": None}
+        self._started_notified = False
+        self._tx_failures: Deque[float] = deque(maxlen=TX_FAIL_N)
+        self._cs_failures = 0
+        self._contacts_list: List[Dict[str, str]] = []
 
         comp = self.cfg.get("companion") or {}
         self.client = CompanionClient(comp.get("host", "127.0.0.1"), int(comp.get("port", 5001)))
@@ -202,11 +225,17 @@ class Hub:
             return False
         for p in problems:
             logger.warning("config: %s", p)
-        old = self.cfg
+        old, old_problems = self.cfg, self.problems
         self.cfg, self.problems = cfg, problems
         logging.getLogger().setLevel(str(cfg.get("log_level") or "INFO").upper())
         if not initial:
             self.engine.cfg = cfg
+            self.notifier.configure(cfg.get("notify") or {})
+            new = [p for p in problems if p not in old_problems]
+            if new:
+                self.notify("problems", "Config problem: %s%s" % (
+                    new[0], " (+%d more)" % (len(new) - 1) if len(new) > 1 else ""),
+                    key="config:" + new[0], every_s=PROBLEM_EVERY_S)
             self._rebuild_regions()
             limits = cfg.get("limits") or {}
             self.tx.gap_s = float(limits.get("tx_gap_s", 2.5))
@@ -235,6 +264,7 @@ class Hub:
         contact = str(w.get("contact") or "").strip()
         ua = "openhop-openbot/%s (https://github.com/zfouts/openhop-openbot-plugin%s)" % (
             __version__, "; " + contact if contact else "")
+        self.user_agent = ua
         self.engine.weather = OpenMeteo(ua)
         self.engine.geocoder = Geocoder(ua, default_country=str(w.get("default_country") or ""))
         cs = self.cfg.get("corescope") or {}
@@ -364,6 +394,11 @@ class Hub:
                 logger.warning("CoreScope region list failed: %s", exc)
                 msg = "CoreScope region list failed: %s" % exc
                 self._cs_seq, self._cs_last = self._cs_seq + 1, (False, msg)
+                self._cs_failures += 1
+                if self._cs_failures >= CS_FAIL_N:
+                    self.notify("problems", "CoreScope region list failed %d times: %s"
+                                % (self._cs_failures, exc), key="corescope",
+                                every_s=PROBLEM_EVERY_S)
                 raise ValueError(msg) from exc
             cache = {"base_url": cs.base, "attempt_at": now, "fetched_at": now,
                      "error": None, "error_at": None, "partial": res["partial"],
@@ -373,6 +408,7 @@ class Hub:
                         " (%s)" % res["partial"] if res["partial"] else "")
             out = {"regions": len(res["regions"]), "partial": res["partial"]}
             self._cs_seq, self._cs_last = self._cs_seq + 1, (True, out)
+            self._cs_failures = 0
             return out
 
     def _save_cs_regions(self, cache: Dict[str, Any]) -> None:
@@ -420,6 +456,7 @@ class Hub:
             asyncio.create_task(self._announce_loop(), name="announce"),
             asyncio.create_task(self._maintenance_loop(), name="maintenance"),
             asyncio.create_task(self._corescope_loop(), name="corescope-regions"),
+            asyncio.create_task(self._update_loop(), name="update-check"),
         ]
         try:
             await self._stop.wait()
@@ -482,6 +519,7 @@ class Hub:
         await self._provision_channels()
         await self._refresh_contacts()
         self.log_activity("tx", detail="companion connected as %s" % self.node.get("name", "?"))
+        self._notify_started()
 
     async def _apply_node_name(self) -> None:
         """Make the radio's name match `node.name` from the plugin page.
@@ -548,6 +586,9 @@ class Hub:
                 heard=c.last_advert or None,
             )
         self._contacts = {c.public_key[:6]: c.name for c in contacts}
+        self._contacts_list = sorted(
+            ({"name": str(c.name or "")[:32], "pubkey": c.public_key.hex()} for c in contacts
+             if len(c.public_key) == 32), key=lambda c: c["name"].lower())[:CONTACTS_MAX]
 
     async def _on_advert(self, advert: Advert) -> None:
         # bare pubkey push; the rich advert comes through the raw frame
@@ -642,6 +683,12 @@ class Hub:
         if result.auto_banned:
             self.log_activity("ban", channel=req.channel, region=req.region,
                               sender=req.sender, detail=result.reason)
+            self.notify("ignored", "Banned %s for now: %s" % (req.sender, result.reason),
+                        key="auto:" + sender_key(req.sender), every_s=IGNORED_EVERY_S)
+        elif result.reason.startswith("banned"):
+            self.notify("ignored", "Ignored %s on %s: %s" % (req.sender, req.channel,
+                                                             result.reason),
+                        key=sender_key(req.sender), every_s=IGNORED_EVERY_S)
         if result.matched:
             answered = bool(result.reply)
             try:
@@ -838,6 +885,14 @@ class Hub:
     def _on_tx_result(self, job: TxJob, ok: bool, why: str) -> None:
         if not ok:
             self.log_activity("error", text=job.text, detail="tx %s: %s" % (job.label, why))
+            if job.kind != "notify":            # a failed notification never notifies
+                now = time.time()
+                self._tx_failures.append(now)
+                if len(self._tx_failures) == TX_FAIL_N \
+                        and now - self._tx_failures[0] <= TX_FAIL_WINDOW_S:
+                    self.notify("problems", "%d messages failed to send in %d min, last: %s"
+                                % (TX_FAIL_N, TX_FAIL_WINDOW_S // 60, why), key="tx",
+                                every_s=PROBLEM_EVERY_S)
         dm = job.dm_prefix is not None
         nbytes = airtime.text_packet_bytes(job.text, node_name=str(self.node.get("name") or ""),
                                            dm=dm, scoped=bool(job.scope))
@@ -932,6 +987,105 @@ class Hub:
                         await asyncio.to_thread(self._announce, ann)
                 except Exception as exc:
                     logger.error("announcement %s failed: %s", ann.get("id"), exc)
+
+    # ------------------------------------------------------ notifications --
+
+    def notify(self, event: str, text: str, *, key: Optional[str] = None,
+               every_s: float = 0.0) -> Dict[str, Any]:
+        """Tell the operator, if they asked for ``event`` (engine/notify.py)."""
+        try:
+            out = self.notifier.notify(event, text, key=key, every_s=every_s)
+        except Exception as exc:
+            logger.error("notification failed: %s", exc, exc_info=True)
+            return {"sent": 0, "failed": [str(exc)]}
+        if out["sent"]:
+            self.log_activity("notify", text=clamp_bytes(text), detail=event)
+        elif out.get("why") == "hourly cap":
+            logger.info("notification dropped (hourly cap): %s", text)
+        for f in out["failed"]:
+            self.log_activity("error", detail="notification to %s" % f)
+        return out
+
+    def _send_notify(self, target: Dict[str, Any], text: str) -> Optional[str]:
+        if target.get("kind") == "dm":
+            try:
+                prefix = bytes.fromhex(str(target.get("pubkey") or ""))[:6]
+            except ValueError:
+                return "bad key"
+            if len(prefix) < 6 or prefix not in self._contacts:
+                return "not a contact of the companion (they need to advertise)"
+            job = TxJob(text=text, dm_prefix=prefix, label="notify:dm", kind="notify")
+        else:
+            idx = self.resolve_channel(target.get("channel"))
+            if idx is None:
+                return "no such channel slot on the radio"
+            job = TxJob(text=text, channel_idx=idx, kind="notify",
+                        scope=self.scope_for(str(target.get("region") or "")),
+                        label="notify:%s" % target.get("channel"))
+        return None if self.tx.put(job) else "send queue full"
+
+    def _notify_started(self) -> None:
+        if self._started_notified:
+            return
+        self._started_notified = True
+        self.notify("started", "OpenBot %s started on %s" % (
+            __version__, self.node.get("name") or "the companion"))
+
+    def _load_notify_state(self) -> Dict[str, Any]:
+        try:
+            data = json.loads(self.notify_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _fetch_latest(self) -> Optional[Dict[str, str]]:
+        return latest_release(repository(self.data_dir), user_agent=self.user_agent)
+
+    def check_update(self, fetch: Optional[Any] = None) -> None:
+        """Ask GitHub now (blocking; tests and the loop's worker thread)."""
+        try:
+            latest = (fetch or self._fetch_latest)()
+        except GitHubError as exc:
+            self._apply_update(None, str(exc))
+            return
+        self._apply_update(latest, None)
+
+    def _apply_update(self, latest: Optional[Dict[str, str]], error: Optional[str]) -> None:
+        info = self.update_info
+        info["checked_at"] = int(time.time())
+        info["error"] = error
+        if error is not None:
+            logger.warning("update check failed: %s", error)
+            self._dirty.set()
+            return
+        info["latest"] = latest["version"] if latest else None
+        info["url"] = latest.get("url") if latest else None
+        info["available"] = bool(latest) and newer(latest["version"], __version__)
+        self._dirty.set()
+        if not info["available"] or self.notify_state.get("update_version") == info["latest"]:
+            return
+        out = self.notify("update", "OpenBot %s is out (running %s). Update from the plugin "
+                          "page." % (info["latest"], __version__))
+        if out["sent"]:
+            self.notify_state["update_version"] = info["latest"]
+            try:
+                atomic_write_json(self.notify_state_path, self.notify_state)
+            except OSError as exc:
+                logger.error("could not save notification state: %s", exc)
+
+    async def _update_loop(self) -> None:
+        if await self._sleep(UPDATE_FIRST_S):
+            return
+        while True:
+            try:
+                latest = await asyncio.to_thread(self._fetch_latest)
+                self._apply_update(latest, None)
+            except GitHubError as exc:
+                self._apply_update(None, str(exc))
+            except Exception as exc:
+                logger.error("update check failed: %s", exc, exc_info=True)
+            if await self._sleep(UPDATE_EVERY_S):
+                return
 
     # ------------------------------------------------------- maintenance ----
 
@@ -1031,6 +1185,12 @@ class Hub:
             if lifted:
                 self.log_activity("ban", sender=sender, detail="automatic ban lifted")
             return {"sender": sender, "lifted": lifted}
+        if action == "notify_test":
+            out = self.notifier.test("Test notification from OpenBot %s" % __version__)
+            if not out["sent"]:
+                raise ValueError("nothing sent: %s" % out.get("why", "no targets"))
+            self.log_activity("notify", detail="test: sent to %d" % out["sent"])
+            return out
         if action == "corescope_regions":
             return await self.refresh_corescope_regions()
         if action == "provision_channels":
@@ -1107,6 +1267,9 @@ class Hub:
             "builtins": builtin_help(),
             "commands": [{"id": k, **v} for k, v in self.cmd_stats.items()],
             "auto_bans": self.store.auto_bans(),
+            "update": dict(self.update_info),
+            "contacts": list(self._contacts_list),
+            "notify": {"sent": self.notifier.sent, "dropped": self.notifier.dropped},
             "mailbox": {"processed": list(self.mailbox_done),
                         "results": copy.deepcopy(self.mailbox_results)},
         }

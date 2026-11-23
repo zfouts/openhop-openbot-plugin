@@ -592,6 +592,34 @@ among them by geography along the chain to this node, so a same-prefix
 repeater far away is not chosen just because CoreScope lists it first. If
 CoreScope is unreachable or slow (5 s), it answers from the local roster.
 
+## Operator notifications
+
+The bot can tell you when something needs you, so you don't have to log in
+to find out. On the **Notifications** tab, add where to send them and turn
+on what you want. Everything is off until you do.
+
+- **Send to**: a channel slot, optionally in a region, or an admin by DM.
+  Everyone on a channel sees what is sent there, so use a private slot (one
+  with a secret) for operator-only notices. Admins are picked from the
+  companion's contacts and kept by public key, because anyone can copy a
+  name. An admin who has never advertised to the companion can't be reached;
+  the tab marks them **not a contact**.
+- **What to send**:
+  - *A new version is out*: the bot checks GitHub every 6 hours, with the
+    same rule as the update button (newest stable release with a wheel), and
+    tells you once per new version.
+  - *Someone was ignored*: a banned sender's command was ignored, or an
+    automatic ban began. Once per sender per day.
+  - *The bot started*: when it starts or restarts, with its version.
+  - *Something needs attention*: config problems after a save, the CoreScope
+    region list failing 3 times running, or 3 messages failing to send
+    within 10 minutes. Each kind at most every 6 hours.
+- **At most, per hour** caps notifications across every kind (default 6).
+  Each one is a message on the air like any other and counts in the Usage
+  tab's airtime as "notifications".
+
+**Send a test notification** sends one to every target now.
+
 ## Updating
 
 The Status tab's **Updates** card shows the version running and the latest

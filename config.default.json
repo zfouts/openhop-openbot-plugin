@@ -184,5 +184,15 @@
     "shortener_url": "",
     "shortener_key": "",
     "mpath_wait_s": 30
+  },
+  "notify": {
+    "targets": [],
+    "events": {
+      "update": false,
+      "ignored": false,
+      "started": false,
+      "problems": false
+    },
+    "max_per_hour": 6
   }
 }
