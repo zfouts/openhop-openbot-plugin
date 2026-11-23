@@ -30,8 +30,8 @@ MAX_BYTES = 2 * 1024 * 1024
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 _VER_RE = re.compile(
-    r"^(\d+(?:\.\d+){0,3})(?:[-.]?(dev|a|alpha|b|beta|c|rc|pre|preview)[-.]?(\d*))?$",
-    re.IGNORECASE)
+    r"^(\d+(?:\.\d+){0,3})(?:[-.]?(dev|a|alpha|b|beta|c|rc|pre|preview)[-.]?(\d*))?"
+    r"(?:[-.]?post[-.]?(\d+))?$", re.IGNORECASE)
 _PRE_RANK = {"dev": 0, "a": 1, "alpha": 1, "b": 2, "beta": 2, "c": 3, "rc": 3, "pre": 3,
              "preview": 3}
 
@@ -43,9 +43,11 @@ class GitHubError(RuntimeError):
 
 
 def version_key(v: Any) -> Optional[tuple]:
-    """A sortable key for ``1.6.0``, ``v1.6.0``, ``1.6.0-rc.1``, ``1.6.0+edge.3``;
-    None when it is not a version. Pre-releases sort below the release, a
-    ``+local`` build above it, as in pip."""
+    """A sortable key for ``1.6.0``, ``v1.6.0``, ``1.6.0-rc.1``, ``1.6.0.post1``,
+    ``1.6.0+edge.3``; None when it is not a version. As in pip (PEP 440):
+    pre-releases sort below the release, post-releases above it, and a
+    ``+local`` build above its base, its segments compared as numbers where
+    they are digits."""
     s = str(v or "").strip()
     s = s[1:] if s[:1] in ("v", "V") else s
     base, plus, local = s.partition("+")
@@ -55,7 +57,10 @@ def version_key(v: Any) -> Optional[tuple]:
     nums = tuple(int(x) for x in m.group(1).split("."))
     nums += (0,) * (4 - len(nums))
     pre = (1, 0, 0) if not m.group(2) else (0, _PRE_RANK[m.group(2).lower()], int(m.group(3) or 0))
-    return (nums, pre, 1 if local else 0, local)
+    post = int(m.group(4)) if m.group(4) else -1
+    segs = tuple((1, int(x), "") if x.isdigit() else (0, 0, x.lower())
+                 for x in re.split(r"[._-]", local)) if local else ()
+    return (nums, pre, post, 1 if local else 0, segs)
 
 
 def newer(a: Any, b: Any) -> bool:

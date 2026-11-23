@@ -22,6 +22,11 @@ def test_newer(a, b):
     assert newer(a, b) and not newer(b, a)
 
 
+def test_post_releases_and_numeric_local_segments():
+    assert newer("1.6.0.post1", "1.6.0") and newer("1.6.1", "1.6.0.post3")
+    assert newer("1.6.0+edge.10", "1.6.0+edge.9")
+
+
 @pytest.mark.parametrize("a,b", [("1.6.0", "1.6.0"), ("v1.6.0", "1.6"), ("junk", "1.0.0"),
                                  ("1.0.0", "junk"), ("", "")])
 def test_not_newer(a, b):
@@ -135,14 +140,23 @@ def test_repeats_are_held_back_per_key():
     assert n.notify("ignored", "bob ignored", key="bob", every_s=86400)["sent"] == 2
 
 
-def test_hourly_cap_counts_messages_not_targets():
-    n, sent, clock = notifier(cap=2)
+def test_hourly_cap_counts_frames_on_air():
+    n, sent, clock = notifier(cap=5)                     # 2 targets: 2 frames an event
     assert n.notify("problems", "a")["sent"] == 2
     assert n.notify("problems", "b")["sent"] == 2
-    assert n.notify("problems", "c")["why"] == "hourly cap"
+    assert n.notify("problems", "c")["why"] == "hourly cap"   # 4 + 2 > 5
     assert n.dropped == 1 and len(sent) == 4
     clock.t += 3601
     assert n.notify("problems", "d")["sent"] == 2
+
+
+def test_ignored_has_its_own_smaller_budget():
+    """Senders rotating names that match a ban must not crowd out the rest."""
+    n, sent, _ = notifier(cap=60, targets=[{"kind": "channel", "channel": "#ops"}])
+    for i in range(10):
+        n.notify("ignored", "spam%d" % i, key="spam%d" % i, every_s=86400)
+    assert len(sent) == 3
+    assert n.notify("problems", "still told")["sent"] == 1
 
 
 def test_text_is_clamped_to_one_frame():
@@ -176,6 +190,7 @@ def test_notify_config_is_validated():
             {"kind": "channel", "channel": "Public"},
             {"kind": "channel", "channel": ""},
             {"kind": "dm", "pubkey": ADMIN.upper(), "name": "zach"},
+            {"kind": "channel", "channel": "0"},
             {"kind": "dm", "pubkey": "abcd"},
             {"kind": "carrier-pigeon"},
             "junk"],
@@ -187,7 +202,8 @@ def test_notify_config_is_validated():
     assert n["events"] == {"update": True, "ignored": False, "started": False, "problems": False}
     assert n["max_per_hour"] == 6
     text = " ".join(problems)
-    for needle in ("Public", "no channel", "abcd", "carrier-pigeon", "max_per_hour"):
+    for needle in ("Public", "no channel", "abcd", "carrier-pigeon", "max_per_hour",
+                   "slot name"):
         assert needle in text
 
 
@@ -196,3 +212,9 @@ def test_notify_ships_off():
     assert defaults()["notify"] == {"targets": [], "events": {"update": False, "ignored": False,
                                                               "started": False, "problems": False},
                                     "max_per_hour": 6}
+
+
+def test_a_problem_never_carries_a_channel_secret():
+    secret = "00112233445566778899aabbccddeeff"
+    _, problems = validate({"channels": [{"idx": "x", "name": "Ops", "secret": secret}]})
+    assert problems and not any(secret in p for p in problems)

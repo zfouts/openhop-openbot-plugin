@@ -93,7 +93,9 @@ CS_REGIONS_TICK_S = 60.0
 CS_REGIONS_MAX = 200
 # Operator notifications (engine/notify.py).
 UPDATE_EVERY_S = 6 * 3600
+UPDATE_RETRY_S = 3600           # after a failed check
 UPDATE_FIRST_S = 60.0           # first check this long after start
+UPDATE_TICK_S = 60.0
 IGNORED_EVERY_S = 24 * 3600     # per sender
 PROBLEM_EVERY_S = 6 * 3600      # per kind of problem
 TX_FAIL_N, TX_FAIL_WINDOW_S = 3, 600.0
@@ -159,6 +161,7 @@ class Hub:
                                             "available": False, "checked_at": None,
                                             "error": None}
         self._started_notified = False
+        self._update_unsent: Optional[Dict[str, str]] = None   # found while the radio was down
         self._tx_failures: Deque[float] = deque(maxlen=TX_FAIL_N)
         self._cs_failures = 0
         self._contacts_list: List[Dict[str, str]] = []
@@ -225,17 +228,20 @@ class Hub:
             return False
         for p in problems:
             logger.warning("config: %s", p)
-        old, old_problems = self.cfg, self.problems
+        old, old_problems = self.cfg, getattr(self, "_good_problems", [])
         self.cfg, self.problems = cfg, problems
+        self._good_problems = list(problems)
         logging.getLogger().setLevel(str(cfg.get("log_level") or "INFO").upper())
         if not initial:
             self.engine.cfg = cfg
             self.notifier.configure(cfg.get("notify") or {})
             new = [p for p in problems if p not in old_problems]
             if new:
-                self.notify("problems", "Config problem: %s%s" % (
-                    new[0], " (+%d more)" % (len(new) - 1) if len(new) > 1 else ""),
-                    key="config:" + new[0], every_s=PROBLEM_EVERY_S)
+                # A count, never the text: a problem can quote config the operator
+                # would not want on the air (a ban pattern, a channel's details).
+                self.notify("problems", "%d new config problem%s after a save; see the plugin "
+                            "page." % (len(new), "" if len(new) == 1 else "s"),
+                            key="config", every_s=PROBLEM_EVERY_S)
             self._rebuild_regions()
             limits = cfg.get("limits") or {}
             self.tx.gap_s = float(limits.get("tx_gap_s", 2.5))
@@ -684,11 +690,11 @@ class Hub:
             self.log_activity("ban", channel=req.channel, region=req.region,
                               sender=req.sender, detail=result.reason)
             self.notify("ignored", "Banned %s for now: %s" % (req.sender, result.reason),
-                        key="auto:" + sender_key(req.sender), every_s=IGNORED_EVERY_S)
+                        key=self.engine.identity(req), every_s=IGNORED_EVERY_S)
         elif result.reason.startswith("banned"):
             self.notify("ignored", "Ignored %s on %s: %s" % (req.sender, req.channel,
                                                              result.reason),
-                        key=sender_key(req.sender), every_s=IGNORED_EVERY_S)
+                        key=self.engine.identity(req), every_s=IGNORED_EVERY_S)
         if result.matched:
             answered = bool(result.reply)
             try:
@@ -947,8 +953,12 @@ class Hub:
 
     # ------------------------------------------------------- announcements --
 
-    def _announce(self, ann: Dict[str, Any]) -> bool:
-        text = render(str(ann.get("text") or ""), self.engine.context(), BUILTINS)
+    async def _announce(self, ann: Dict[str, Any]) -> bool:
+        """Render in a worker thread (templates may call web services), then
+        queue on the event loop: the TX queue and its callbacks, notifications
+        among them, are not thread-safe."""
+        text = await asyncio.to_thread(
+            render, str(ann.get("text") or ""), self.engine.context(), BUILTINS)
         if not text:
             return False
         ok = self.send_text(ann.get("channel"), text, ann.get("region") or "",
@@ -984,7 +994,7 @@ class Hub:
                         if due:
                             self._ann_minute[ann["id"]] = minute
                     if due:
-                        await asyncio.to_thread(self._announce, ann)
+                        await self._announce(ann)
                 except Exception as exc:
                     logger.error("announcement %s failed: %s", ann.get("id"), exc)
 
@@ -1039,10 +1049,23 @@ class Hub:
         return data if isinstance(data, dict) else {}
 
     def _fetch_latest(self) -> Optional[Dict[str, str]]:
-        return latest_release(repository(self.data_dir), user_agent=self.user_agent)
+        # A plain User-Agent: the one for the weather services carries the
+        # operator's contact, which GitHub has no need for.
+        return latest_release(repository(self.data_dir),
+                              user_agent="openhop-openbot/%s" % __version__)
+
+    def _update_due(self, now: Optional[float] = None) -> bool:
+        """Only while the operator wants update notices: off means no requests."""
+        if not self.notifier.wants("update"):
+            return False
+        at = self.update_info.get("checked_at")
+        if not isinstance(at, (int, float)):
+            return True
+        return (now or time.time()) - at >= (UPDATE_RETRY_S if self.update_info.get("error")
+                                             else UPDATE_EVERY_S)
 
     def check_update(self, fetch: Optional[Any] = None) -> None:
-        """Ask GitHub now (blocking; tests and the loop's worker thread)."""
+        """Ask GitHub now and apply the answer (blocking; for tests)."""
         try:
             latest = (fetch or self._fetch_latest)()
         except GitHubError as exc:
@@ -1062,7 +1085,11 @@ class Hub:
         info["url"] = latest.get("url") if latest else None
         info["available"] = bool(latest) and newer(latest["version"], __version__)
         self._dirty.set()
+        self._update_unsent = None
         if not info["available"] or self.notify_state.get("update_version") == info["latest"]:
+            return
+        if not self.client.is_connected():
+            self._update_unsent = latest            # told once the companion is back
             return
         out = self.notify("update", "OpenBot %s is out (running %s). Update from the plugin "
                           "page." % (info["latest"], __version__))
@@ -1078,13 +1105,16 @@ class Hub:
             return
         while True:
             try:
-                latest = await asyncio.to_thread(self._fetch_latest)
-                self._apply_update(latest, None)
+                if self._update_unsent is not None and self.client.is_connected():
+                    self._apply_update(self._update_unsent, None)
+                elif self._update_due():
+                    latest = await asyncio.to_thread(self._fetch_latest)
+                    self._apply_update(latest, None)
             except GitHubError as exc:
                 self._apply_update(None, str(exc))
             except Exception as exc:
                 logger.error("update check failed: %s", exc, exc_info=True)
-            if await self._sleep(UPDATE_EVERY_S):
+            if await self._sleep(UPDATE_TICK_S):
                 return
 
     # ------------------------------------------------------- maintenance ----
@@ -1168,7 +1198,7 @@ class Hub:
                         if a.get("id") == args.get("id")), None)
             if ann is None:
                 raise ValueError("no announcement %r" % args.get("id"))
-            return {"queued": await asyncio.to_thread(self._announce, ann)}
+            return {"queued": await self._announce(ann)}
         if action == "clear_cooldowns":
             return {"cleared": self.store.clear_fires()}
         if action == "ban_test":

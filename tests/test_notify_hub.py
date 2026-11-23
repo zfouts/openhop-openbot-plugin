@@ -72,6 +72,16 @@ async def test_a_banned_sender_is_reported_once_a_day(tmp_path):
     assert len(texts) == 2 and "spammer" in texts[0]          # one message, two targets
 
 
+async def test_an_automatic_ban_then_ignored_commands_notify_once(tmp_path):
+    h = make_hub(tmp_path, limits={"user_cooldown_s": 0, "tx_max_per_min": 100,
+                                   "user_max_requests": 1, "user_window_s": 600},
+                 auto_ban={"enabled": True, "strikes": 1, "window_s": 600, "ban_h": 2})
+    await deliver(h, "bob: !ping")
+    await deliver(h, "bob: !path")                            # auto-ban: one notice
+    await deliver(h, "bob: !help")                            # now ignored: no second one
+    assert len(notes(h)) == 2
+
+
 async def test_an_automatic_ban_is_reported(tmp_path):
     h = make_hub(tmp_path, limits={"user_cooldown_s": 0, "tx_max_per_min": 100,
                                    "user_max_requests": 1, "user_window_s": 600},
@@ -121,13 +131,36 @@ def test_a_failed_update_check_is_recorded_not_sent(tmp_path):
     assert not notes(h) and "rate limit" in h.update_info["error"]
 
 
-def test_new_config_problems_are_reported(tmp_path):
+def test_new_config_problems_are_reported_without_their_text(tmp_path):
+    secret = "00112233445566778899aabbccddeeff"
     h = make_hub(tmp_path)
     cfg = json.loads((tmp_path / "config.json").read_text())
     cfg["node"] = {"path_hash_bytes": 9}
+    cfg["channels"].append({"idx": "x", "name": "Ops", "secret": secret})
+    cfg["bans"] = [{"pattern": "(unclosed"}]
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     assert h._reload_config()
-    assert any("path_hash_bytes" in j.text for j in notes(h))
+    texts = [j.text for j in notes(h)]
+    assert texts and all("3 new config problems" in t for t in texts)
+    assert not any(secret in t or "unclosed" in t for t in texts)
+
+
+def test_an_unreadable_config_does_not_make_old_problems_new(tmp_path):
+    import os
+    h = make_hub(tmp_path)
+    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg["node"] = {"path_hash_bytes": 9}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(cfg))
+    assert h._reload_config()
+    n = len(notes(h))
+    h.notifier._last.clear()                                   # repeat window passed
+    path.write_text("{not json")
+    os.utime(path, ns=(1, 1))
+    h._reload_config()
+    path.write_text(json.dumps(cfg))
+    assert h._reload_config()
+    assert len(notes(h)) == n
 
 
 def test_repeated_tx_failures_are_reported_once(tmp_path):
@@ -159,3 +192,47 @@ async def test_test_action_and_runtime(tmp_path):
     rt = json.loads((tmp_path / "runtime.json").read_text())
     assert rt["contacts"] == [{"name": "zach", "pubkey": ADMIN}]
     assert rt["notify"]["sent"] == 1 and "update" in rt
+
+
+def test_update_check_is_off_with_the_update_event_off(tmp_path):
+    h = make_hub(tmp_path, events=("ignored",))
+    assert not h._update_due(1_800_000_000)
+    h2 = make_hub(tmp_path)                                    # all events on
+    assert h2._update_due(1_800_000_000)
+    h2.update_info["checked_at"] = 1_800_000_000 - 60
+    assert not h2._update_due(1_800_000_000)
+    h2.update_info["checked_at"] = 1_800_000_000 - 6 * 3600
+    assert h2._update_due(1_800_000_000)
+
+
+def test_github_never_gets_the_operators_contact(tmp_path, monkeypatch):
+    import openhop_openbot.hub as hubmod
+    h = make_hub(tmp_path, weather={"contact": "op@example.com"})
+    seen = {}
+    monkeypatch.setattr(hubmod, "latest_release",
+                        lambda repo, user_agent: seen.setdefault("ua", user_agent))
+    h._fetch_latest()
+    assert seen["ua"] == "openhop-openbot/" + __version__
+
+
+def test_update_waits_for_the_companion(tmp_path):
+    h = make_hub(tmp_path)
+    latest = {"version": "99.0.0", "tag": "v99.0.0", "url": ""}
+    h.client.is_connected = lambda: False
+    h.check_update(fetch=lambda: latest)
+    assert not notes(h) and "update_version" not in h.notify_state
+    h.client.is_connected = lambda: True
+    h.check_update(fetch=lambda: latest)
+    assert len(notes(h)) == 2
+
+
+async def test_announcements_queue_on_the_event_loop_thread(tmp_path):
+    import threading
+    h = make_hub(tmp_path, announcements=[{"id": "a1", "channel": "#bot", "region": "",
+                                           "schedule": "every 3600", "text": "hello"}])
+    loop_thread = threading.get_ident()
+    seen = []
+    real = h.tx.put
+    h.tx.put = lambda job: (seen.append(threading.get_ident()), real(job))[1]
+    assert (await h.execute("announce_now", {"id": "a1"}))["queued"] is True
+    assert seen == [loop_thread]

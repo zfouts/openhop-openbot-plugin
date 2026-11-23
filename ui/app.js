@@ -293,6 +293,7 @@ function validate() {
     }
   });
   num(c.notify.max_per_hour, 'Notifications per hour', 1, 60, true);
+  if (c.notify.max_per_hour < c.notify.targets.length) e.push('Notifications per hour must be at least the number of targets (' + c.notify.targets.length + '): each notification goes to all of them');
   if (c.weather.default_country && !/^[A-Za-z]{2}$/.test(c.weather.default_country)) e.push('Default country must be a 2-letter code such as us, gb or de');
   if (c.node.latitude != null) num(c.node.latitude, 'Latitude', -90, 90);
   if (c.node.longitude != null) num(c.node.longitude, 'Longitude', -180, 180);
@@ -1307,10 +1308,10 @@ function tabAnnounce() {
 
 // ---------------------------------------------------------------- tab: notifications
 const NOTIFY_EVENTS = [
-  ['update', 'A new version is out', 'Checks GitHub every 6 hours, the same check as the update button, and tells you once per new version.'],
-  ['ignored', 'Someone was ignored', 'A banned sender\'s command was ignored, or an automatic ban began. Once per sender per day.'],
+  ['update', 'A new version is out', 'Checks GitHub every 6 hours while this is on, the same check as the update button, and tells you once per new version.'],
+  ['ignored', 'Someone was ignored', 'A banned sender\'s command was ignored, or an automatic ban began. Once per sender per day, and at most 3 an hour.'],
   ['started', 'The bot started', 'When the bot starts or restarts, with the version it runs. Handy to confirm an update took.'],
-  ['problems', 'Something needs attention', 'Config problems after a save, the CoreScope region list failing 3 times running, or 3 messages failing to send within 10 minutes. Each kind at most every 6 hours.'],
+  ['problems', 'Something needs attention', 'New config problems after a save (how many, not what they say), the CoreScope region list failing 3 times running, or 3 messages failing to send within 10 minutes. Each kind at most every 6 hours.'],
 ];
 function tabNotify() {
   const n = cfg.notify;
@@ -1328,16 +1329,18 @@ function tabNotify() {
     if (!where.length && !on.length) return 'Off. Add somewhere to send notifications, then pick what to send.';
     if (!where.length) return 'Off until you add somewhere to send them.';
     if (!on.length) return 'Off until you turn on at least one kind below.';
-    return 'Sends to ' + listText(where) + ' when: ' + listText(on) + '. At most ' + plural(n.max_per_hour, 'message') + ' an hour.';
+    return 'Sends to ' + listText(where) + ' when: ' + listText(on) + '. At most ' + plural(n.max_per_hour, 'message') + ' on the air an hour.';
   };
   const sync = () => {
     summary.textContent = describe();
     test.disabled = !n.targets.length;
     test.title = n.targets.length ? '' : 'Add somewhere to send notifications first.';
+    showUpdate();                       // declared below; sync only runs after it is
   };
 
   const updateText = () => {
     const u = rt && rt.update;
+    if (!n.events.update) return 'Off: the bot does not check for updates.';
     if (!u) return 'The bot reports its update check once it is running this version.';
     if (u.error) return 'Last update check failed' + (u.checked_at ? ' ' + ago(u.checked_at) : '') + ': ' + u.error;
     if (!u.checked_at) return 'The bot checks for updates a minute after it starts.';
@@ -1406,7 +1409,7 @@ function tabNotify() {
     else toast('Queued for ' + plural(res.sent, 'target') + '.' + (res.failed && res.failed.length ? ' Not sent: ' + res.failed.join('; ') : ''), !!(res.failed && res.failed.length));
   } });
 
-  const showUpdate = () => { updLine.textContent = updateText(); updLine.classList.toggle('mark', !!(rt && rt.update && rt.update.available)); };
+  const showUpdate = () => { updLine.textContent = updateText(); updLine.classList.toggle('mark', !!(n.events.update && rt && rt.update && rt.update.available)); };
   renderList(); sync(); showUpdate();
   const recent = h('div');
   const renderRecent = () => {
@@ -1427,7 +1430,7 @@ function tabNotify() {
       h('div', { class: 'checks' }, NOTIFY_EVENTS.map(([k, label, hint]) => h('div', { class: 'event' },
         check(label, n.events, k, { onchange: sync }), h('small', { class: 'hint', text: hint }),
         k === 'update' ? updLine : null))),
-      field('At most, per hour', numIn(n, 'max_per_hour', { min: 1, max: 60, step: 1, onchange: sync }), '1 to 60 messages, across every kind. Extra ones are dropped, not queued.', 'narrow')),
+      field('At most, per hour', numIn(n, 'max_per_hour', { min: 1, max: 60, step: 1, onchange: sync }), '1 to 60 messages on the air, across every kind: one notification to 3 targets counts 3. Extra ones are dropped, not queued.', 'narrow')),
     h('div', { class: 'card stack' }, h('div', { class: 'row' }, h('h2', { class: 'grow', text: 'Recently sent' }), test), recent)),
   refresh: () => { showUpdate(); renderRecent(); } };
 }

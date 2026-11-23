@@ -208,15 +208,17 @@ configured slot (hashtag or private), never a protected channel; `region` as
 for announcements. A `dm` target is a companion contact by full public key;
 the bot can only DM contacts the companion has, and reports the ones it
 can't. Each event goes to every target as one message clamped to 160 bytes,
-through the TX queue (kind `notify`). `max_per_hour` (1-60) caps messages
-across every event; extra ones are dropped. Events:
+through the TX queue (kind `notify`). `max_per_hour` (1-60, at least the
+number of targets) caps frames on the air across every event: one event to
+three targets counts three, and an event goes to every target or none. Extra
+ones are dropped. Events:
 
 | Event | When | Repeats |
 |---|---|---|
-| `update` | GitHub's newest stable release with a wheel (the repository in openHop's `state.json`, else `zfouts/openhop-openbot-plugin`) is newer than the running version. Checked 1 minute after start, then every 6 hours. | Once per version; remembered in `data/notify_state.json`, and only once it was actually sent |
-| `ignored` | A banned sender's command was ignored, or an automatic ban began | Once per sender per 24 hours |
+| `update` | GitHub's newest stable release with a wheel (the repository in openHop's `state.json`, else `zfouts/openhop-openbot-plugin`) is newer than the running version. Checked only while `update` is on: from 1 minute after start, every 6 hours (1 hour after a failure), with a plain `openhop-openbot/<version>` User-Agent. Found while the companion is down, it is sent once it reconnects. | Once per version; remembered in `data/notify_state.json` once queued |
+| `ignored` | A banned sender's command was ignored, or an automatic ban began | Once per sender (DM senders by key) per 24 hours, and at most 3 events an hour |
 | `started` | The first companion connection after the bot starts | Once per run |
-| `problems` | New config problems after a save; CoreScope's region list failing 3 times in a row; 3 transmissions failing within 10 minutes (notifications themselves excluded) | Once per kind per 6 hours |
+| `problems` | New config problems after a save (the count only: problem text can quote config); CoreScope's region list failing 3 times in a row; 3 transmissions failing within 10 minutes (notifications themselves excluded) | Once per kind per 6 hours |
 
 ### CoreScope
 

@@ -82,11 +82,13 @@ def validate(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
 
     chans = []
     seen_idx = set()
-    for ch in cfg.get("channels") or []:
+    for i, ch in enumerate(cfg.get("channels") or [], 1):
         try:
             idx = int(ch.get("idx"))
         except (TypeError, ValueError, AttributeError):
-            problems.append(f"channel {ch!r}: idx must be a number")
+            # Name the entry, never print it: it may carry a private channel's secret.
+            label = (str(ch.get("name") or "").strip() if isinstance(ch, dict) else "") or f"#{i}"
+            problems.append(f"channel {label}: idx must be a number")
             continue
         name = str(ch.get("name") or "").strip()
         secret = str(ch.get("secret") or "").strip()
@@ -346,6 +348,10 @@ def _validate_notify(cfg: Dict[str, Any], problems: List[str]) -> None:
             if not ch:
                 problems.append(f"notify target #{i}: no channel; skipped")
                 continue
+            if ch.isdigit():
+                problems.append(f"notify target #{i}: channel must be a slot name, not a "
+                                "number; skipped")
+                continue
             if chan_norm(ch) in protected:
                 problems.append(f"notify target {ch}: protected channel, the bot never sends "
                                 "there; skipped")
@@ -384,6 +390,11 @@ def _validate_notify(cfg: Dict[str, Any], problems: List[str]) -> None:
            "max_per_hour": n.get("max_per_hour")}
     _number(out, "max_per_hour", MAX_PER_HOUR, *MAX_PER_HOUR_RANGE, "notify.max_per_hour",
             problems, integer=True)
+    if out["max_per_hour"] < len(targets):
+        problems.append(f"notify.max_per_hour ({out['max_per_hour']}) is below the number of "
+                        f"targets; each notification goes to all {len(targets)}, so using "
+                        f"{len(targets)}")
+        out["max_per_hour"] = len(targets)
     cfg["notify"] = out
 
 

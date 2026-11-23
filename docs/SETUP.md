@@ -605,18 +605,21 @@ on what you want. Everything is off until you do.
   name. An admin who has never advertised to the companion can't be reached;
   the tab marks them **not a contact**.
 - **What to send**:
-  - *A new version is out*: the bot checks GitHub every 6 hours, with the
-    same rule as the update button (newest stable release with a wheel), and
-    tells you once per new version.
+  - *A new version is out*: while this is on, the bot checks GitHub every 6
+    hours, with the same rule as the update button (newest stable release
+    with a wheel), and tells you once per new version. With it off, the bot
+    makes no requests to GitHub.
   - *Someone was ignored*: a banned sender's command was ignored, or an
-    automatic ban began. Once per sender per day.
+    automatic ban began. Once per sender per day, and at most 3 an hour.
   - *The bot started*: when it starts or restarts, with its version.
-  - *Something needs attention*: config problems after a save, the CoreScope
+  - *Something needs attention*: new config problems after a save (how many;
+    the text stays on the plugin page, since it can quote config), the CoreScope
     region list failing 3 times running, or 3 messages failing to send
     within 10 minutes. Each kind at most every 6 hours.
-- **At most, per hour** caps notifications across every kind (default 6).
-  Each one is a message on the air like any other and counts in the Usage
-  tab's airtime as "notifications".
+- **At most, per hour** caps messages on the air across every kind (default
+  6). One notification to three targets is three messages, so this must be at
+  least the number of targets. Each counts in the Usage tab's airtime as
+  "notifications".
 
 **Send a test notification** sends one to every target now.
 

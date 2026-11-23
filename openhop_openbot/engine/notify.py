@@ -9,9 +9,11 @@ to every target as one message that fits one frame.
 Events: ``update`` (a newer release is out), ``ignored`` (a banned sender's
 command was ignored, or an automatic ban began), ``started`` (the bot came
 up) and ``problems`` (config problems, CoreScope failing, transmissions
-failing). Callers pass a ``key`` and ``every_s`` to hold back repeats, and
-``max_per_hour`` caps messages across every event, because each one costs
-airtime on a shared channel.
+failing). Callers pass a ``key`` and ``every_s`` to hold back repeats.
+``max_per_hour`` caps frames on the air (an event to three targets is three),
+because each one costs airtime on a shared channel; an event goes to every
+target or to none. ``ignored`` also has a small budget of its own, so senders
+rotating names that match a ban cannot crowd out the other notices.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ EVENTS = ("update", "ignored", "started", "problems")
 MAX_PER_HOUR = 6
 MAX_PER_HOUR_RANGE = (1, 60)
 KEYS_MAX = 1000
+EVENT_PER_HOUR = {"ignored": 3}     # events, on top of the frame cap
 
 # send(target, text) -> None when queued, else why not
 Send = Callable[[Dict[str, Any], str], Optional[str]]
@@ -44,7 +47,8 @@ class Notifier:
         self.targets: List[Dict[str, Any]] = []
         self.events: Dict[str, bool] = {e: False for e in EVENTS}
         self.max_per_hour = MAX_PER_HOUR
-        self._recent: Deque[float] = deque()
+        self._recent: Deque[float] = deque()        # one entry per frame queued
+        self._per_event: Dict[str, Deque[float]] = {e: deque() for e in EVENT_PER_HOUR}
         self._last: Dict[Tuple[str, str], float] = {}
         self.sent = 0
         self.dropped = 0
@@ -72,7 +76,16 @@ class Notifier:
         k = (event, key) if key is not None else None
         if k is not None and now - self._last.get(k, float("-inf")) < every_s:
             return {"sent": 0, "failed": [], "why": "repeat"}
+        budget = self._per_event.get(event)
+        if budget is not None:
+            while budget and now - budget[0] >= 3600:
+                budget.popleft()
+            if len(budget) >= EVENT_PER_HOUR[event]:
+                self.dropped += 1
+                return {"sent": 0, "failed": [], "why": "%s limit" % event}
         out = self._deliver(text, now)
+        if out["sent"] and budget is not None:
+            budget.append(now)
         if out["sent"] and k is not None:
             self._last[k] = now
             if len(self._last) > KEYS_MAX:
@@ -90,7 +103,7 @@ class Notifier:
             return {"sent": 0, "failed": [], "why": "no targets"}
         while self._recent and now - self._recent[0] >= 3600:
             self._recent.popleft()
-        if len(self._recent) >= self.max_per_hour:
+        if len(self._recent) + len(self.targets) > self.max_per_hour:
             self.dropped += 1
             return {"sent": 0, "failed": [], "why": "hourly cap"}
         text = clamp_bytes(text)
@@ -102,7 +115,7 @@ class Notifier:
             else:
                 failed.append("%s: %s" % (target_label(t), why))
         if sent:
-            self._recent.append(now)
+            self._recent.extend([now] * sent)
             self.sent += 1
         out: Dict[str, Any] = {"sent": sent, "failed": failed}
         if not sent:
