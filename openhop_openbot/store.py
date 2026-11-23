@@ -127,6 +127,17 @@ CREATE TABLE IF NOT EXISTS tx_log (
     outcome    TEXT NOT NULL      -- 'sent', 'failed' (companion refused) or 'dropped'
 );
 CREATE INDEX IF NOT EXISTS tx_log_ts ON tx_log (ts);
+
+-- Scoped packets this radio heard, per UTC day and region. Each packet counts
+-- once, however many relays repeat it. region '' counts every scoped packet,
+-- matched or not: it sets how many matches chance alone would produce.
+CREATE TABLE IF NOT EXISTS region_heard (
+    day     INTEGER NOT NULL,     -- epoch seconds // 86400
+    region  TEXT NOT NULL,        -- '#name', or '' for all scoped packets
+    packets INTEGER NOT NULL DEFAULT 0,
+    last    REAL NOT NULL,        -- when the latest one was heard
+    PRIMARY KEY (day, region)
+);
 """
 
 MSG_RETENTION_S = 7 * 86400
@@ -135,6 +146,7 @@ NODE_RETENTION_S = 60 * 86400
 USAGE_RETENTION_S = 366 * 86400
 TRAFFIC_RETENTION_S = 366 * 86400
 LIMIT_RETENTION_S = 2 * 86400       # hits and strikes: longer than any limit window
+REGION_RETENTION_S = 30 * 86400
 
 
 def _row(r: sqlite3.Row) -> Dict[str, Any]:
@@ -533,6 +545,44 @@ class Store:
                        (since, until))
         return [_row(r) for r in rows]
 
+    # ------------------------------------------------------------ regions ---
+
+    def count_region(self, region: str, ts: Optional[float] = None) -> None:
+        ts = time.time() if ts is None else ts
+        self._x(
+            """INSERT INTO region_heard (day, region, packets, last) VALUES (?,?,1,?)
+               ON CONFLICT (day, region) DO UPDATE
+               SET packets = packets + 1, last = max(last, excluded.last)""",
+            (int(ts // 86400), region, ts))
+
+    def add_region_counts(self, rows: Iterable[tuple]) -> None:
+        """Add ``(day, region, packets, last)`` rows in one transaction."""
+        rows = list(rows)
+        if not rows:
+            return
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                self._db.executemany(
+                    """INSERT INTO region_heard (day, region, packets, last) VALUES (?,?,?,?)
+                       ON CONFLICT (day, region) DO UPDATE
+                       SET packets = packets + excluded.packets,
+                           last = max(last, excluded.last)""", rows)
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+            self._db.execute("COMMIT")
+
+    def region_counts(self, since: float) -> Dict[str, Dict[str, Any]]:
+        """Per region: packets heard on days from ``since``'s day on, and when
+        it was last heard at all (within retention)."""
+        rows = self._q(
+            """SELECT region,
+                      sum(CASE WHEN day >= ? THEN packets ELSE 0 END) AS packets,
+                      max(last) AS last
+               FROM region_heard GROUP BY region""", (int(since // 86400),))
+        return {r["region"]: {"packets": r["packets"], "last": r["last"]} for r in rows}
+
     # ---------------------------------------------------------- retention --
 
     def prune(self, now: Optional[int] = None) -> None:
@@ -547,4 +597,5 @@ class Store:
         self._x("DELETE FROM tx_log WHERE ts < ?", (now - TRAFFIC_RETENTION_S,))
         self._x("DELETE FROM hits WHERE ts < ?", (now - LIMIT_RETENTION_S,))
         self._x("DELETE FROM strikes WHERE ts < ?", (now - LIMIT_RETENTION_S,))
+        self._x("DELETE FROM region_heard WHERE day < ?", ((now - REGION_RETENTION_S) // 86400,))
         self._x("DELETE FROM auto_bans WHERE until < ?", (now,))

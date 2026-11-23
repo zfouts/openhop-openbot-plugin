@@ -73,6 +73,11 @@ top-level `regions` list. A request's region is one of:
 `*` to allow unscoped floods. When a region list is non-empty, `?` never
 matches (the bot fails closed), and `direct` always matches.
 
+Every scoped packet the radio hears (any payload type) is also tested against
+`regions` and, with CoreScope on, up to 64 regions from CoreScope's list, and
+counted per region and UTC day in `openbot.db` (`region_heard`, 30 days). See
+`runtime.regions` below.
+
 With `limits.reply_in_request_region` on, a reply is sent scoped to the
 region its request arrived under (unscoped if it arrived unscoped), so a
 `#tx-dfw` question gets a `#tx-dfw` answer. Announcements and manual sends take an
@@ -251,6 +256,7 @@ result.
 | `ban_test` | `name` | `{"name": "...", "banned": "ban #1 ^spam"}`: the rule or automatic ban that applies, `""` when none. Uses the saved config. |
 | `unban` | `sender` | `{"sender": "bob", "lifted": bool}`: lifts an automatic ban and clears that sender's strikes. |
 | `provision_channels` | | `{"channels": [...]}` |
+| `corescope_regions` | | `{"regions": n, "partial": null \| "why"}`. Fetches CoreScope's region list now (`/api/scope-stats?window=7d` and `/api/scope-audit?window=1h`) and caches it in `data/corescope_regions.json`. Error when CoreScope is off or the stats fetch fails; `partial` is set when only the repeater counts failed. The bot also fetches on start and every 6 hours. |
 | `usage` | `{"range": "24h"\|"7d"\|"30d"\|"90d"\|"1y"}` or `{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}` | The usage report below. Dates are in `node.timezone`. |
 | `advert` | `{"flood": true\|false}` (default `true`) | `{"sent": bool, "flood": bool}`. Error if the companion is not connected. |
 
@@ -332,6 +338,14 @@ comes back as the action's error.
                "tx_queue": 0},
   "channels": [{"idx": 1, "name": "#bot", "ok": true}],
   "regions_seen": {"#tx-dfw": 12, "*": 40, "?": 3, "direct": 1},
+  "regions": {"window_days": 7, "scoped_packets": 5210,
+              "watching": ["#tx-dfw", "#tx-fw"],
+              "heard": [{"name": "#tx-dfw", "packets": 412,
+                         "last_heard": 1731170000, "verified": true}],
+              "corescope": {"enabled": true, "fetched_at": 1731160000,
+                            "error": null, "error_at": null, "partial": null,
+                            "regions": [{"name": "#tx-dfw", "packets": 1203,
+                                         "repeaters": 9}]}},
   "activity": [{"ts": 1731170000, "kind": "reply", "channel": "#bot",
                 "region": "#tx-dfw", "sender": "bob", "text": "...",
                 "detail": "path"}],
@@ -347,6 +361,13 @@ comes back as the action's error.
   "mailbox": {"processed": ["c-..."], "results": {"c-...": {"ok": true}}}
 }
 ```
+
+`regions.heard` lists every region with a count kept (30 days): `packets` is
+the last `window_days` UTC days, `last_heard` the latest packet at all.
+`verified` is `packets >= 3` and a Poisson tail below 1e-6, with
+`scoped_packets / 65536` expected chance matches. `watching` is every region
+the bot tests packets against. `corescope.regions` is empty when CoreScope is
+off or the cached list came from another base URL.
 
 `activity.kind` is one of `rx`, `reply`, `skip`, `nudge` (an unscoped
 reply), `ban` (an automatic ban began or was lifted), `announce`, `tx`,

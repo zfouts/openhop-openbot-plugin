@@ -5,6 +5,7 @@
                                                  └─► follow-ups (`!mpath`) ──(wait)──┘
     config.json ──(mtime poll)──► reload + `_cmd` mailbox
     runtime.json ◄── snapshot every few seconds and on change
+    scoped frames ──► RegionWatch (which regions this radio hears) ◄── CoreScope's region list
 
 Nothing here blocks the event loop: template rendering (which may call NWS)
 runs in a worker thread, and the companion reader only ever enqueues.
@@ -51,15 +52,17 @@ from .mesh.frames import (
     canonical_region,
     channel_hash_byte,
     decode_advert_frame,
+    decode_frame_header,
     frame_scope,
     group_text_plain,
     hashtag_secret,
     region_key,
 )
+from .mesh.regionwatch import RegionWatch
 from .mesh.txqueue import EXTRA_GAP_S, TxJob, TxQueue
 from .services.geocode import Geocoder
 from .services.openmeteo import OpenMeteo
-from .services.corescope import CoreScope
+from .services.corescope import CoreScope, CoreScopeError, region_name
 from .services.shortener import DEFAULT as DEFAULT_SHORTENER
 from .services.shortener import make_shortener
 from .store import Store
@@ -79,6 +82,11 @@ MAX_FOLLOW_UPS = 16
 NUDGE_SETTLE_S = 8.0
 MAX_NUDGES_WAITING = 16
 SCOPED_SEEN_S = 120.0
+# CoreScope's region list: fetched at start, then this often; a failed fetch
+# is retried sooner. The loop looks this often whether one is due.
+CS_REGIONS_EVERY_S = 6 * 3600
+CS_REGIONS_RETRY_S = 15 * 60
+CS_REGIONS_TICK_S = 60.0
 
 
 def _public_secret() -> bytes:
@@ -120,6 +128,10 @@ class Hub:
         self._reload_config(initial=True)
 
         self.store = Store(data_dir / "openbot.db")
+        self.regionwatch = RegionWatch(self.store)
+        self.cs_regions_path = data_dir / "corescope_regions.json"
+        self.cs_regions: Dict[str, Any] = self._load_cs_regions()
+        self._cs_lock = asyncio.Lock()
         self.node: Dict[str, Any] = {"started_at": self.started_at}
         self.engine = Engine(self.cfg, self.store, node=self.node)
         self._build_services()
@@ -240,6 +252,7 @@ class Hub:
             logger.info("CoreScope at %s: !path map links and !mpath (shortener: %s)",
                         self.engine.corescope.base,
                         self.engine.shortener.label if self.engine.shortener else "none")
+        self._apply_cs_regions()
 
     @staticmethod
     def _strip_cmd(v: Any) -> str:
@@ -255,6 +268,104 @@ class Hub:
                 logger.warning("region %r has no auto key (private '$' regions are not "
                                "supported); it can never match", name)
         self.region_keys = keys
+        self.regionwatch.set_enabled(keys)
+
+    # ------------------------------------------------- CoreScope regions ----
+
+    def _load_cs_regions(self) -> Dict[str, Any]:
+        """The last region list fetched from CoreScope, from data/. A missing or
+        unreadable file is an empty cache: the next fetch rewrites it."""
+        try:
+            data = json.loads(self.cs_regions_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        def n(v: Any) -> int:
+            return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+        rows = []
+        for r in data.get("regions") or []:
+            name = region_name(r.get("name")) if isinstance(r, dict) else None
+            if name is not None:
+                rows.append({"name": name, "packets": n(r.get("packets")),
+                             "repeaters": n(r.get("repeaters"))})
+        data["regions"] = rows
+        return data
+
+    def _cs_regions_for(self, cs: Any) -> Dict[str, Any]:
+        """The cache, when it came from this CoreScope; else nothing."""
+        if cs is None or self.cs_regions.get("base_url") != cs.base:
+            return {}
+        return self.cs_regions
+
+    def _apply_cs_regions(self) -> None:
+        cache = self._cs_regions_for(self.engine.corescope)
+        self.regionwatch.set_candidates(r["name"] for r in cache.get("regions") or [])
+
+    def _cs_regions_due(self, cs: Any, now: Optional[float] = None) -> bool:
+        now = time.time() if now is None else now
+        cache = self._cs_regions_for(cs)
+        at = cache.get("attempt_at")
+        if not isinstance(at, (int, float)):
+            return True
+        return now - at >= (CS_REGIONS_RETRY_S if cache.get("error") else CS_REGIONS_EVERY_S)
+
+    async def refresh_corescope_regions(self) -> Dict[str, Any]:
+        """Fetch CoreScope's region list now, cache it, and start watching for
+        its regions on air. Raises ValueError when CoreScope is off or the
+        fetch fails; a failure keeps the last list and records why."""
+        cs = self.engine.corescope
+        if cs is None:
+            raise ValueError("CoreScope is off. Turn it on, with a base URL, on the "
+                             "CoreScope tab.")
+        async with self._cs_lock:
+            now = int(time.time())
+            cache = dict(self._cs_regions_for(cs)) or {"base_url": cs.base, "regions": []}
+            cache["attempt_at"] = now
+            try:
+                res = await asyncio.to_thread(cs.regions)
+            except CoreScopeError as exc:
+                cache.update(error=str(exc), error_at=now)
+                self._save_cs_regions(cache)
+                logger.warning("CoreScope region list failed: %s", exc)
+                raise ValueError("CoreScope region list failed: %s" % exc) from exc
+            cache = {"base_url": cs.base, "attempt_at": now, "fetched_at": now,
+                     "error": None, "error_at": None, "partial": res["partial"],
+                     "regions": res["regions"]}
+            self._save_cs_regions(cache)
+            logger.info("CoreScope knows %d regions%s", len(res["regions"]),
+                        " (%s)" % res["partial"] if res["partial"] else "")
+            return {"regions": len(res["regions"]), "partial": res["partial"]}
+
+    def _save_cs_regions(self, cache: Dict[str, Any]) -> None:
+        self.cs_regions = cache
+        try:
+            atomic_write_json(self.cs_regions_path, cache)
+        except OSError as exc:
+            logger.error("could not save CoreScope's region list: %s", exc)
+        self._apply_cs_regions()
+        self._dirty.set()
+
+    async def _corescope_loop(self) -> None:
+        while not self._stop.is_set():
+            cs = self.engine.corescope
+            if cs is not None and self._cs_regions_due(cs):
+                with contextlib.suppress(ValueError):
+                    await self.refresh_corescope_regions()
+            if await self._sleep(CS_REGIONS_TICK_S):
+                return
+
+    def _regions_runtime(self) -> Dict[str, Any]:
+        cs = self.engine.corescope
+        cache = self._cs_regions_for(cs)
+        return {**self.regionwatch.summary(),
+                "corescope": {"enabled": cs is not None,
+                              "fetched_at": cache.get("fetched_at"),
+                              "error": cache.get("error"),
+                              "error_at": cache.get("error_at"),
+                              "partial": cache.get("partial"),
+                              "regions": cache.get("regions") or []}}
 
     # ----------------------------------------------------------- lifecycle --
 
@@ -268,6 +379,7 @@ class Hub:
             asyncio.create_task(self._runtime_loop(), name="runtime"),
             asyncio.create_task(self._announce_loop(), name="announce"),
             asyncio.create_task(self._maintenance_loop(), name="maintenance"),
+            asyncio.create_task(self._corescope_loop(), name="corescope-regions"),
         ]
         try:
             await self._stop.wait()
@@ -407,6 +519,15 @@ class Hub:
         frame = None
         with contextlib.suppress(Exception):
             frame = self.correlator.remember(raw, snr, rssi)
+        hdr = frame.hdr if frame is not None else None
+        if hdr is None:
+            with contextlib.suppress(Exception):
+                hdr = decode_frame_header(raw)
+        if hdr is not None and hdr.get("transport_codes"):
+            try:
+                self.regionwatch.observe(hdr)      # runtime.json picks it up on its heartbeat
+            except Exception as exc:
+                logger.warning("region count failed: %s", exc)
         if frame is not None and frame.type == PAYLOAD_TYPE_GRP_TXT \
                 and frame.hdr.get("transport_codes"):
             now = time.monotonic()
@@ -850,6 +971,8 @@ class Hub:
             if lifted:
                 self.log_activity("ban", sender=sender, detail="automatic ban lifted")
             return {"sender": sender, "lifted": lifted}
+        if action == "corescope_regions":
+            return await self.refresh_corescope_regions()
         if action == "provision_channels":
             if not self.client.is_connected():
                 raise ValueError("companion not connected")
@@ -917,6 +1040,7 @@ class Hub:
                          "tx_queue": len(self.tx)},
             "channels": [{"idx": i, **s} for i, s in sorted(self.slots.items())],
             "regions_seen": dict(self.regions_seen),
+            "regions": self._regions_runtime(),
             "activity": list(self.activity),
             "roster": {"nodes": counts["nodes"], "repeaters": counts["repeaters"],
                        "recent": recent},

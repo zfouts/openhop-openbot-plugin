@@ -164,6 +164,32 @@ take an explicit `region`: empty for the companion's default scope,
 
 Private `$` regions are not supported. Only `#name` regions can be matched.
 
+### The Regions table
+
+The **Scope & Regions** tab lists every region the bot knows about in one
+table: the ones in `regions`, the ones CoreScope lists (with CoreScope on),
+and any the radio has heard. Ticking **Use** adds a region to `regions`.
+**Answer requests from** picks between any region (`scope.regions` empty) and
+only the regions ticked under **Answer** (`scope.regions` lists them, plus `*`
+for messages with no region). Switching to the second ticks every region in
+use and `*`, so nothing changes until you untick one.
+
+**Heard here** is what this radio heard over the last 7 days. The bot tests
+every scoped packet it hears (any type, not just chat) against the regions in
+use and against up to 64 of the regions CoreScope lists, so a region can show
+as live before you tick it. Each packet counts once however many relays repeat
+it. **Verified** means at least 3 separate packets, and more than chance would
+explain: a region code is only 16 bits, so on a busy mesh any region matches
+an unrelated packet now and then. **Heard, not confirmed** means some matches
+but not enough to rule chance out. Counts are kept 30 days in `openbot.db`.
+
+**CoreScope (7 days)** is what CoreScope reports: packets its observers
+matched to the region, and how many repeaters say they carry it. The bot
+fetches the list on start and every 6 hours (15 minutes after a failure), and
+**Refresh from CoreScope** fetches it now. The last list is kept in
+`data/corescope_regions.json`, so it survives restarts; a list from a
+different CoreScope address is not used.
+
 ## `!path`
 
 ```
@@ -518,6 +544,9 @@ The link is shortened before it goes on the air:
 | `da.gd` | [da.gd](https://da.gd/help). |
 | `custom` | Your own shortener running the same software as v.gd and is.gd. Set its address and, if it needs one, its key. |
 | `none` | No shortener: the full link, used only when it fits beside the hashes (short paths). |
+
+With CoreScope on, the Scope & Regions tab also lists the regions it knows.
+See [The Regions table](#the-regions-table).
 
 Each link is shortened once per run. If the shortener fails or is
 rate-limited, `!path` uses the full link if it fits beside every hash, and
